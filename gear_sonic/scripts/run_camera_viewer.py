@@ -56,6 +56,26 @@ class CameraViewerConfig:
     max_display_width: int = 640
     """Max width per camera tile in the display window."""
 
+    depth_max_mm: float = 2000.0
+    """Upper bound of the depth colormap, in millimetres. Values above saturate to red.
+    Visualisation only — does not affect any data on the wire or on disk."""
+
+
+def _to_displayable_bgr(img: np.ndarray, depth_max_mm: float) -> np.ndarray:
+    """Map any camera image to a 3-channel BGR uint8 frame for display / MP4.
+
+    * Color (HxWx3 uint8 RGB) -> BGR (channel swap only).
+    * Depth (HxW uint16, millimetres) -> JET colormap normalised to ``depth_max_mm``.
+      Zero values (no-depth) stay near-black. Lossy & for human eyes only — never
+      use this output as training data.
+    """
+    if img.ndim == 3 and img.shape[2] == 3 and img.dtype == np.uint8:
+        return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    if img.ndim == 2 and img.dtype == np.uint16:
+        depth_8u = cv2.convertScaleAbs(img, alpha=255.0 / max(depth_max_mm, 1.0))
+        return cv2.applyColorMap(depth_8u, cv2.COLORMAP_JET)
+    raise ValueError(f"Unsupported image for viewer: shape={img.shape}, dtype={img.dtype}")
+
 
 def main(config: CameraViewerConfig):
     client = ComposedCameraClientSensor(server_ip=config.camera_host, port=config.camera_port)
@@ -108,10 +128,7 @@ def main(config: CameraViewerConfig):
                 if img is None:
                     continue
 
-                if img.shape[2] == 3:
-                    img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                else:
-                    img_bgr = img
+                img_bgr = _to_displayable_bgr(img, config.depth_max_mm)
 
                 if is_recording and name in video_writers:
                     video_writers[name].write(img_bgr)
