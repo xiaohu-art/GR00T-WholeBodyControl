@@ -49,6 +49,8 @@ sim = [
     "msgpack",
     "msgpack-numpy",
     "opencv-python",
+    "pandas",
+    "pyarrow",
 ]
 # Data collection: Sonic VLA data exporter with LeRobot dataset output
 # Usage: pip install -e "gear_sonic[data_collection]"
@@ -87,7 +89,9 @@ inference = [
     "tyro",
     "opencv-python",
     "scipy",
-    "Isaac-GR00T @ git+https://github.com/NVIDIA/Isaac-GR00T.git",
+    # gr00t (Isaac-GR00T) is installed separately by install_inference.sh
+    # because its pyproject.toml references local wheels that uv rejects as
+    # transitive git dependencies.
 ]
 # Training: full RL training stack (Isaac Lab must be installed separately)
 # Usage: pip install -e "gear_sonic[training]"

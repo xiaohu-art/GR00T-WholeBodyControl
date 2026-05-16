@@ -25,6 +25,7 @@ from datetime import datetime
 import json
 import time
 
+import msgpack
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 import tyro
@@ -35,6 +36,8 @@ from gear_sonic.data.features_sonic_vla import (
     get_features_sonic_vla,
     get_g1_robot_model,
     get_modality_config_sonic_vla,
+    get_tactile_features,
+    get_tactile_modality_config,
     get_wrist_camera_features,
     get_wrist_camera_modality_config,
 )
@@ -99,6 +102,19 @@ class SonicDataExporterConfig:
 
     record_wrist_cameras: bool = False
     """Record wrist camera streams (left_wrist, right_wrist). Requires cameras to be available."""
+
+    # ZMQ: JuQiao tactile skin suit (from tactile_publisher.py)
+    record_tactile: bool = False
+    """Record JuQiao tactile skin suit stream (observation.tactile_raw)."""
+
+    tactile_zmq_host: str = "localhost"
+    """ZMQ host for tactile publisher."""
+
+    tactile_zmq_port: int = 5558
+    """ZMQ port for tactile publisher."""
+
+    tactile_max_age_sec: float = 0.1
+    """Max age (seconds) for the latest tactile frame; older -> zero-filled."""
 
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
@@ -227,6 +243,10 @@ class GrootDataCollector:
         sonic_data_zmq_port: int = 5556,
         state_zmq_host: str = "localhost",
         state_zmq_port: int = 5557,
+        record_tactile: bool = False,
+        tactile_zmq_host: str = "localhost",
+        tactile_zmq_port: int = 5558,
+        tactile_max_age_sec: float = 0.1,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
@@ -244,6 +264,10 @@ class GrootDataCollector:
         self.latest_proprio_msg = None
         self.latest_sonic_msg = None
         self.latest_planner_msg = None
+        self.latest_tactile_msg = None
+
+        self.record_tactile = record_tactile
+        self.tactile_max_age_sec = tactile_max_age_sec
 
         self.current_stream_mode = 0
 
@@ -273,6 +297,26 @@ class GrootDataCollector:
         except Exception as e:
             print(f"[Sonic] Warning: Failed to initialize ZMQ subscriber: {e}")
             self._sonic_zmq_socket = None
+
+        self._tactile_zmq_ctx = None
+        self._tactile_zmq_socket = None
+        if record_tactile:
+            try:
+                self._tactile_zmq_ctx = zmq.Context()
+                self._tactile_zmq_socket = self._tactile_zmq_ctx.socket(zmq.SUB)
+                self._tactile_zmq_socket.connect(
+                    f"tcp://{tactile_zmq_host}:{tactile_zmq_port}"
+                )
+                self._tactile_zmq_socket.setsockopt(zmq.RCVTIMEO, 100)
+                self._tactile_zmq_socket.setsockopt(zmq.CONFLATE, 1)
+                self._tactile_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "tactile")
+                time.sleep(0.2)
+                print(
+                    f"[Tactile] Subscribed to {tactile_zmq_host}:{tactile_zmq_port} (topic=tactile)"
+                )
+            except Exception as e:
+                print(f"[Tactile] Warning: failed to init ZMQ subscriber: {e}")
+                self._tactile_zmq_socket = None
 
         self.telemetry = Telemetry(window_size=100)
         self.sonic_timing_monitor = TimingThresholdMonitor(
@@ -304,6 +348,33 @@ class GrootDataCollector:
             msg["ros_timestamp"] = time.time()
 
         self.latest_proprio_msg = msg
+
+    def _poll_tactile_zmq(self):
+        """Poll the ``tactile`` ZMQ topic (non-blocking, CONFLATE keeps latest only)."""
+        if self._tactile_zmq_socket is None:
+            return
+        try:
+            parts = self._tactile_zmq_socket.recv_multipart(zmq.NOBLOCK)
+        except zmq.Again:
+            return
+        except Exception as e:
+            print(f"[Tactile] recv error: {e}")
+            return
+        if len(parts) != 3 or parts[0] != b"tactile":
+            return
+        try:
+            header = msgpack.unpackb(parts[1], raw=False)
+        except Exception as e:
+            print(f"[Tactile] msgpack decode error: {e}")
+            return
+        payload = np.frombuffer(parts[2], dtype=np.uint8)
+        if payload.shape != (256,):
+            return
+        self.latest_tactile_msg = {
+            "receive_timestamp": time.time(),
+            "host_time": float(header.get("host_time", 0.0)),
+            "raw": payload,
+        }
 
     def _check_recording_commands(self):
         """Check keyboard + ZMQ toggle flags for recording commands."""
@@ -610,10 +681,25 @@ class GrootDataCollector:
 
         self._add_images_to_frame_data(frame_data)
 
+        if self.record_tactile:
+            self._add_tactile_to_frame_data(frame_data)
+
         self._log_latency_periodic(sonic_latency_ms)
 
         self.data_exporter.add_frame(frame_data)
         return self._finalize_frame(t_start)
+
+    def _add_tactile_to_frame_data(self, frame_data: dict) -> None:
+        """Populate observation.tactile_raw, zero-filling if no fresh sample."""
+        tactile_msg = self.latest_tactile_msg
+        if tactile_msg is None:
+            frame_data["observation.tactile_raw"] = np.zeros(256, dtype=np.uint8)
+            return
+        age_sec = time.time() - tactile_msg["receive_timestamp"]
+        if age_sec > self.tactile_max_age_sec:
+            frame_data["observation.tactile_raw"] = np.zeros(256, dtype=np.uint8)
+            return
+        frame_data["observation.tactile_raw"] = tactile_msg["raw"]
 
     def _add_cpp_state_features(self, frame_data: dict, proprio: dict) -> None:
         if "base_quat" in proprio:
@@ -844,13 +930,13 @@ class GrootDataCollector:
             self._state_subscriber.close()
         except Exception:
             pass
-        for sock in [self._sonic_zmq_socket]:
+        for sock in [self._sonic_zmq_socket, self._tactile_zmq_socket]:
             if sock is not None:
                 try:
                     sock.close()
                 except Exception:
                     pass
-        for ctx in [self._sonic_zmq_ctx]:
+        for ctx in [self._sonic_zmq_ctx, self._tactile_zmq_ctx]:
             if ctx is not None:
                 try:
                     ctx.term()
@@ -869,6 +955,9 @@ class GrootDataCollector:
 
                     with self.telemetry.timer("poll_sonic"):
                         self._poll_sonic_zmq_messages()
+
+                    with self.telemetry.timer("poll_tactile"):
+                        self._poll_tactile_zmq()
 
                     with self.telemetry.timer("poll_image"):
                         img_msg = self._image_subscriber.read()
@@ -924,6 +1013,16 @@ def main(config: SonicDataExporterConfig):
             else:
                 modality_config[key] = value
 
+    if config.record_tactile:
+        print("[Tactile] Tactile suit enabled — adding to dataset schema")
+        dataset_features.update(get_tactile_features())
+        tactile_modality = get_tactile_modality_config()
+        for key, value in tactile_modality.items():
+            if key in modality_config:
+                modality_config[key].update(value)
+            else:
+                modality_config[key] = value
+
     text_to_speech = TextToSpeech() if config.text_to_speech else None
 
     robot_config = poll_robot_config_zmq(
@@ -936,7 +1035,11 @@ def main(config: SonicDataExporterConfig):
         features=dataset_features,
         modality_config=modality_config,
         task=config.task_prompt,
-        script_config={**robot_config, "record_wrist_cameras": config.record_wrist_cameras},
+        script_config={
+            **robot_config,
+            "record_wrist_cameras": config.record_wrist_cameras,
+            "record_tactile": config.record_tactile,
+        },
     )
 
     data_collector = GrootDataCollector(
@@ -950,6 +1053,10 @@ def main(config: SonicDataExporterConfig):
         sonic_data_zmq_port=config.sonic_zmq_port,
         state_zmq_host=config.state_zmq_host,
         state_zmq_port=config.state_zmq_port,
+        record_tactile=config.record_tactile,
+        tactile_zmq_host=config.tactile_zmq_host,
+        tactile_zmq_port=config.tactile_zmq_port,
+        tactile_max_age_sec=config.tactile_max_age_sec,
     )
     data_collector.run()
 

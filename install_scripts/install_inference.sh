@@ -56,6 +56,23 @@ echo "[INFO] Creating .venv_inference with uv-managed Python 3.10 …"
 uv venv .venv_inference --python "$MANAGED_PY" --prompt gear_sonic_inference
 # shellcheck disable=SC1091
 source .venv_inference/bin/activate
+echo "[INFO] Installing Isaac-GR00T (gr00t) from local clone …"
+# Isaac-GR00T must be installed from a local path (editable), not from git,
+# because its pyproject.toml references local wheel files for aarch64 wheels.
+# uv rejects local wheel sources whenever the package itself was fetched from
+# git, even when the wheels' platform markers exclude the current arch.
+# A sibling clone is expected at ../Isaac-GR00T relative to this repo.
+ISAAC_GR00T_DIR="${ISAAC_GR00T_DIR:-$(cd "$REPO_ROOT/../Isaac-GR00T" && pwd)}"
+if [ ! -f "$ISAAC_GR00T_DIR/pyproject.toml" ]; then
+    echo "[ERROR] Isaac-GR00T not found at $ISAAC_GR00T_DIR"
+    echo "        Clone it as a sibling directory:"
+    echo "          cd $(dirname "$REPO_ROOT")"
+    echo "          git clone https://github.com/NVIDIA/Isaac-GR00T.git"
+    echo "        Or set ISAAC_GR00T_DIR=/path/to/Isaac-GR00T before running."
+    exit 1
+fi
+echo "[OK] Using Isaac-GR00T at: $ISAAC_GR00T_DIR"
+uv pip install -e "$ISAAC_GR00T_DIR"
 echo "[INFO] Installing gear_sonic[inference] (this may take a few minutes) …"
 uv pip install -e "gear_sonic[inference]"
 

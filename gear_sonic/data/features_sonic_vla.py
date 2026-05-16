@@ -395,6 +395,26 @@ def get_wrist_camera_modality_config() -> dict:
     }
 
 
+def get_tactile_features() -> dict:
+    """Features for optional JuQiao tactile skin suit (added when ``record_tactile``)."""
+    return {
+        "observation.tactile_raw": {
+            "dtype": "uint8",
+            "shape": (256,),
+            "names": [f"raw_{i:03d}" for i in range(1, 257)],
+        },
+    }
+
+
+def get_tactile_modality_config() -> dict:
+    """Modality config entries for optional tactile skin suit."""
+    return {
+        "tactile": {
+            "tactile_raw": {"original_key": "observation.tactile_raw"},
+        },
+    }
+
+
 def get_g1_robot_model(
     waist_location: Literal[
         "lower_body", "upper_body", "lower_and_upper_body"
