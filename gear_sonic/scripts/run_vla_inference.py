@@ -41,6 +41,10 @@ from gear_sonic.utils.data_collection.keyboard_subscriber import (
 from gear_sonic.utils.data_collection.telemetry import Telemetry
 from gear_sonic.utils.data_collection.transforms import compute_projected_gravity
 from gear_sonic.utils.data_collection.zmq_state_subscriber import ZMQStateSubscriber
+from gear_sonic.utils.inference.dataset_initial_poses import (
+    DatasetInitialPoses,
+    load_dataset_initial_poses,
+)
 from gear_sonic.utils.inference.initial_poses import LATENT_INITIAL_MOTION_TOKEN
 from gear_sonic.utils.inference.vla_utils import (
     calculate_latency_compensated_index,
@@ -113,6 +117,13 @@ class InferenceConfig:
     # Prompt / eval
     prompt: str = "demo"
     """The language prompt for the VLA policy."""
+
+    # Initial pose
+    dataset_path: str = ""
+    """Optional LeRobot dataset path. When set, the initial motion token sent
+    on 'i' is the per-prompt mean of first-frame ``action.motion_token`` values
+    from that dataset (falling back to a global mean over all episodes, and to
+    the hardcoded LATENT_INITIAL_MOTION_TOKEN if the dataset can't be loaded)."""
 
     # Debug
     verbose_timing: bool = False
@@ -407,6 +418,27 @@ def main(config: InferenceConfig):
     initial_pose_left_hand_closed = False
     initial_pose_right_hand_closed = False
 
+    # Optional dataset-derived initial poses (per-prompt average of first-frame
+    # motion tokens). Falls back to LATENT_INITIAL_MOTION_TOKEN if not provided
+    # or if loading fails.
+    dataset_poses: DatasetInitialPoses | None = None
+    if config.dataset_path:
+        try:
+            dataset_poses = load_dataset_initial_poses(config.dataset_path)
+            print_green(
+                f"Loaded dataset initial poses from {config.dataset_path} "
+                f"({dataset_poses.n_episodes_loaded} episodes, "
+                f"{len(dataset_poses.by_prompt)} tasks)"
+            )
+            print(dataset_poses.summary())
+        except Exception as e:
+            print(
+                f"WARNING: failed to load dataset initial poses from "
+                f"{config.dataset_path}: {e}. Falling back to hardcoded "
+                f"LATENT_INITIAL_MOTION_TOKEN."
+            )
+            dataset_poses = None
+
     def publish_initial_pose():
         """Publish initial pose command to move robot to starting position."""
         print("Moving to initial pose")
@@ -420,14 +452,27 @@ def main(config: InferenceConfig):
             if initial_pose_right_hand_closed
             else np.zeros(7, dtype=np.float32)
         )
+
+        motion_token = LATENT_INITIAL_MOTION_TOKEN
+        token_source = "hardcoded LATENT_INITIAL_MOTION_TOKEN"
+        if dataset_poses is not None:
+            current_prompt = language_prompt_ref[0]
+            dataset_token = dataset_poses.lookup(current_prompt)
+            if dataset_token is not None:
+                motion_token = dataset_token
+                if current_prompt in dataset_poses.by_prompt:
+                    token_source = f"dataset mean for prompt {current_prompt!r}"
+                else:
+                    token_source = f"dataset global mean (prompt {current_prompt!r} not in dataset)"
+
         zmq_message = pack_latent_action_message(
-            motion_token=LATENT_INITIAL_MOTION_TOKEN,
+            motion_token=motion_token,
             frame_index=np.array([0], dtype=np.int64),
             left_hand_joints=left_hand,
             right_hand_joints=right_hand,
         )
         zmq_socket.send(zmq_message)
-        print_green("Sent latent initial pose via ZMQ")
+        print_green(f"Sent latent initial pose via ZMQ ({token_source})")
         time.sleep(1.0)
         print("Initial pose done.")
 

@@ -32,13 +32,13 @@ Usage (from repo root — no venv activation needed):
     python gear_sonic/scripts/launch_inference.py --no-data-exporter     # no recording pane
 """
 
+import base64
 from dataclasses import dataclass
-from pathlib import Path
 import os
+from pathlib import Path
 import shutil
 import signal
 import socket
-import base64
 import subprocess
 import sys
 import textwrap
@@ -125,6 +125,12 @@ class InferenceLaunchConfig:
 
     prompt: str = "demo"
     """Language prompt for inference."""
+
+    dataset_path: str = ""
+    """Optional LeRobot dataset path used to derive the initial motion token
+    sent on 'i'. When set, the token is the per-prompt mean of first-frame
+    ``action.motion_token`` values from that dataset (falling back to the
+    dataset's global mean, then to the hardcoded constant)."""
 
     action_publish_rate: int = 50
     """Rate at which individual actions are published to the C++ control loop (Hz)."""
@@ -269,6 +275,8 @@ def main(config: InferenceLaunchConfig):
     print(f"  Action rate:     {config.action_publish_rate} Hz")
     print(f"  Action horizon:  {config.action_horizon}")
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
+    if config.dataset_path:
+        print(f"  Init pose data:  {config.dataset_path}")
     print(f"  Data exporter:   {'Yes' if config.data_exporter else 'No'}")
     if config.data_exporter:
         print(f"    DC frequency:  {config.data_exporter_frequency} Hz")
@@ -386,6 +394,8 @@ def main(config: InferenceLaunchConfig):
         f"--camera-host {config.camera_host} "
         f"--camera-port {config.camera_port}"
     )
+    if config.dataset_path:
+        inference_cmd += f" --dataset-path '{config.dataset_path}'"
 
     print("Starting VLA inference (pane 1)...")
     _send_to_pane(2, inference_cmd, wait=1.0)
