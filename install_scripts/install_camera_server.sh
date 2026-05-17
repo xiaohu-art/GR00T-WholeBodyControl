@@ -60,6 +60,58 @@ source .venv_camera/bin/activate
 echo "[INFO] Installing gear_sonic[camera] …"
 uv pip install -e "gear_sonic[camera]"
 
+# ── 4b. Link system-installed pyrealsense2 into the venv ─────────────────────
+# librealsense's Python wrapper must be built from source on aarch64
+# (Intel doesn't publish ARM wheels). uv venvs don't see system site-packages
+# by default, so we drop a .pth file that points at pyrealsense2's parent dir.
+echo ""
+echo "[INFO] Searching for system-installed pyrealsense2 …"
+
+SYSTEM_RS_DIR=""
+# Probe order: most-likely first
+# - /usr/lib/python3/dist-packages       — where librealsense 2.55+ lands when
+#                                          built with PYTHON_EXECUTABLE=/usr/bin/python3
+# - /usr/local/lib/python3.10/dist-packages — alternate cmake install dir
+# - /usr/local/lib                       — legacy JetsonHacks layout (.so directly)
+for candidate in \
+    /usr/lib/python3/dist-packages \
+    /usr/local/lib/python3.10/dist-packages \
+    /usr/local/lib/python3.10/site-packages \
+    /usr/lib/python3.10/dist-packages \
+    /usr/local/lib; do
+    if [ -d "$candidate/pyrealsense2" ] || \
+        ls "$candidate"/pyrealsense2.cpython-310-*.so >/dev/null 2>&1; then
+        SYSTEM_RS_DIR="$candidate"
+        break
+    fi
+done
+
+if [ -n "$SYSTEM_RS_DIR" ]; then
+    VENV_SITE=$("$REPO_ROOT/.venv_camera/bin/python" -c \
+        "import site; print(site.getsitepackages()[0])")
+    echo "$SYSTEM_RS_DIR" > "$VENV_SITE/system_pyrealsense.pth"
+    echo "[OK] Found pyrealsense2 in: $SYSTEM_RS_DIR"
+    echo "[OK] Wrote .pth file:      $VENV_SITE/system_pyrealsense.pth"
+
+    # Verify the binding actually loads under venv's Python (catches ABI mismatch)
+    if "$REPO_ROOT/.venv_camera/bin/python" -c \
+            "import pyrealsense2 as rs; \
+            print('[OK] venv import OK at:', rs.__file__)" 2>&1; then
+        :
+    else
+        echo "[WARN] pyrealsense2 linked but import failed — likely ABI mismatch."
+        echo "       Rebuild librealsense with:"
+        echo "         -DPYTHON_EXECUTABLE=$REPO_ROOT/.venv_camera/bin/python"
+        echo "       so the .so matches this venv's Python 3.10 ABI exactly."
+    fi
+else
+    echo "[INFO] No system pyrealsense2 found. If you plan to use RealSense:"
+    echo "       1. Build librealsense from source with"
+    echo "          -DBUILD_PYTHON_BINDINGS=ON -DPYTHON_EXECUTABLE=/usr/bin/python3"
+    echo "       2. Re-run this script — it will auto-link pyrealsense2 into the venv"
+fi
+echo ""
+
 echo ""
 echo "══════════════════════════════════════════════════════════════"
 echo "  Camera server venv setup complete!"
@@ -68,8 +120,11 @@ echo ""
 echo "  Activate the venv with:"
 echo "    source .venv_camera/bin/activate"
 echo ""
-echo "  For other camera SDKs, install into the venv:"
-echo "    pip install pyrealsense2     # Intel RealSense"
+echo "  For Intel RealSense:"
+echo "    - On aarch64 (Jetson): build librealsense from source with"
+echo "        -DBUILD_PYTHON_BINDINGS=ON -DPYTHON_EXECUTABLE=/usr/bin/python3"
+echo "      Then re-run this script (it auto-links pyrealsense2 into the venv)."
+echo "    - On x86_64: pip install pyrealsense2  (PyPI wheels work)"
 echo ""
 echo "  See docs/source/tutorials/data_collection.md for full setup."
 echo "══════════════════════════════════════════════════════════════"

@@ -106,10 +106,13 @@ class PoseMessageSchema:
 class ImageMessageSchema:
     """Standardized message schema for camera images.
 
-    Handles two encodings on the wire:
+    Handles these encodings on the wire (per image):
 
     * **str** – legacy base64-encoded JPEG.
     * **bytes** – raw JPEG from on-device MJPEG encoder (e.g. OAK).
+    * **dict** with ``{"encoding": "depth_png16", "data": <bytes>}`` –
+      16-bit single-channel depth frame, losslessly PNG-compressed.
+      Tagged so it is never confused with a color JPEG payload.
     """
 
     timestamps: dict[str, float]
@@ -120,6 +123,8 @@ class ImageMessageSchema:
         for key, image in self.images.items():
             if isinstance(image, bytes | bytearray):
                 serialized_msg["images"][key] = image
+            elif isinstance(image, np.ndarray) and image.dtype == np.uint16:
+                serialized_msg["images"][key] = ImageUtils.encode_depth_png16(image)
             else:
                 serialized_msg["images"][key] = ImageUtils.encode_image(image)
         return serialized_msg
@@ -136,6 +141,8 @@ class ImageMessageSchema:
                 images[key] = ImageUtils.decode_image(value)
             elif isinstance(value, np.ndarray):
                 images[key] = value
+            elif isinstance(value, dict) and value.get("encoding") == ImageUtils.DEPTH_PNG16_TAG:
+                images[key] = ImageUtils.decode_depth_png16(value["data"])
             elif isinstance(value, dict) and b"nd" in value:
                 images[key] = m.decode(value)
             else:
@@ -220,15 +227,13 @@ class CameraMountPosition(Enum):
 
 
 class ImageUtils:
+
+    DEPTH_PNG16_TAG = "depth_png16"
+
     @staticmethod
     def encode_image(image: np.ndarray) -> str:
         _, color_buffer = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         return base64.b64encode(color_buffer).decode("utf-8")
-
-    @staticmethod
-    def encode_depth_image(image: np.ndarray) -> str:
-        depth_compressed = cv2.imencode(".png", image)[1].tobytes()
-        return base64.b64encode(depth_compressed).decode("utf-8")
 
     @staticmethod
     def decode_image(image: str) -> np.ndarray:
@@ -236,8 +241,16 @@ class ImageUtils:
         color_array = np.frombuffer(color_data, dtype=np.uint8)
         return cv2.imdecode(color_array, cv2.IMREAD_COLOR)
 
+    # ---- Depth (16-bit single-channel, PNG, tagged dict) -------------------
     @staticmethod
-    def decode_depth_image(image: str) -> np.ndarray:
-        depth_data = base64.b64decode(image)
-        depth_array = np.frombuffer(depth_data, dtype=np.uint8)
-        return cv2.imdecode(depth_array, cv2.IMREAD_UNCHANGED)
+    def encode_depth_png16(image: np.ndarray) -> dict[str, Any]:
+        assert image.dtype == np.uint16, (
+            f"encode_depth_png16 expects uint16 depth, got dtype={image.dtype}"
+        )
+        _, buf = cv2.imencode(".png", image)
+        return {"encoding": ImageUtils.DEPTH_PNG16_TAG, "data": buf.tobytes()}
+
+    @staticmethod
+    def decode_depth_png16(data: bytes) -> np.ndarray:
+        # IMREAD_UNCHANGED preserves the 16-bit single-channel layout.
+        return cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
