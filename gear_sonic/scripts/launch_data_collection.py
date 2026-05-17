@@ -138,21 +138,18 @@ class DataCollectionLaunchConfig:
     record_wrist_cameras: bool = False
     """Record wrist camera streams (left_wrist, right_wrist) in the dataset."""
 
-    # Tactile suit (JuQiao)
+    # Tactile suit (JuQiao). The publisher is expected to run separately
+    # (typically on the G1 onboard PC where the USB serial device lives) and
+    # PUB on tcp://<host>:<port>. The launcher only configures the subscriber
+    # side of the data exporter.
     record_tactile: bool = False
-    """Enable JuQiao tactile skin suit publisher and record observation.tactile_raw."""
+    """Subscribe to a JuQiao tactile publisher and record observation.tactile_raw."""
 
-    tactile_port: str = "/dev/ttyACM0"
-    """Serial port for the tactile suit (e.g. /dev/ttyACM0)."""
-
-    tactile_baud: int = 921600
-    """Baud rate for the tactile suit serial connection."""
+    tactile_zmq_host: str = "localhost"
+    """ZMQ host the tactile publisher is bound to (e.g. the G1's IP)."""
 
     tactile_zmq_port: int = 5558
-    """ZMQ port the tactile publisher binds and the data exporter subscribes to."""
-
-    tactile_calibration_samples: int = 100
-    """Number of zero-point calibration frames at publisher startup."""
+    """ZMQ port the tactile publisher is bound to (data exporter subscribes here)."""
 
     text_to_speech: bool = True
     """Enable voice feedback via espeak (data exporter)."""
@@ -307,7 +304,13 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  DC frequency:    {config.data_exporter_frequency} Hz")
     print(f"  Camera viewer:   {'Yes' if config.camera_viewer else 'No'}")
     print(f"  Wrist cameras:   {'Yes' if config.record_wrist_cameras else 'No'}")
-    print(f"  Tactile suit:    {('Yes (' + config.tactile_port + ')') if config.record_tactile else 'No'}")
+    if config.record_tactile:
+        print(
+            f"  Tactile suit:    Yes (subscribing "
+            f"tcp://{config.tactile_zmq_host}:{config.tactile_zmq_port})"
+        )
+    else:
+        print("  Tactile suit:    No")
     print(f"  Text-to-speech:  {'Yes' if config.text_to_speech else 'No'}")
     print(f"  PICO vis:        vr3pt={config.pico_vis_vr3pt} smpl={config.pico_vis_smpl}")
     print(f"  PC IP (for PICO): {_get_local_ip()}")
@@ -334,34 +337,6 @@ def main(config: DataCollectionLaunchConfig):
         )
         print("Starting MuJoCo simulator (window: sim)...")
         time.sleep(3.0)
-
-        # Switch back to the data_collection window for the remaining panes
-        subprocess.run(
-            ["tmux", "select-window", "-t", f"{SESSION_NAME}:data_collection"],
-        )
-
-    # --- Window 'tactile' (optional): JuQiao tactile publisher ---
-    if config.record_tactile:
-        subprocess.run(
-            ["tmux", "new-window", "-t", SESSION_NAME, "-n", "tactile"],
-        )
-        juqiao_dir = repo_root / "JuQiao"
-        tactile_cmd = (
-            f"cd {repo_root} && "
-            f"source .venv_data_collection/bin/activate && "
-            f"cd {juqiao_dir} && "
-            f"python3 scripts/tactile_publisher.py "
-            f"--port {config.tactile_port} "
-            f"--baud {config.tactile_baud} "
-            f"--zmq-port {config.tactile_zmq_port} "
-            f"--calibration-samples {config.tactile_calibration_samples}"
-        )
-        tactile_target = f"{SESSION_NAME}:tactile"
-        subprocess.run(
-            ["tmux", "send-keys", "-t", tactile_target, tactile_cmd, "C-m"],
-        )
-        print("Starting tactile publisher (window: tactile)...")
-        time.sleep(2.0)
 
         # Switch back to the data_collection window for the remaining panes
         subprocess.run(
@@ -440,7 +415,9 @@ def main(config: DataCollectionLaunchConfig):
         exporter_cmd += " --record-wrist-cameras"
     if config.record_tactile:
         exporter_cmd += (
-            f" --record-tactile --tactile-zmq-port {config.tactile_zmq_port}"
+            f" --record-tactile"
+            f" --tactile-zmq-host {config.tactile_zmq_host}"
+            f" --tactile-zmq-port {config.tactile_zmq_port}"
         )
     if not config.text_to_speech:
         exporter_cmd += " --no-text-to-speech"
@@ -464,9 +441,11 @@ def main(config: DataCollectionLaunchConfig):
         print("    MuJoCo Simulator (.venv_sim)")
         print()
     if config.record_tactile:
-        print("  Window 'tactile':")
-        print(f"    JuQiao tactile publisher on {config.tactile_port}")
-        print(f"    ZMQ PUB tcp://*:{config.tactile_zmq_port} (topic=tactile)")
+        print(
+            f"  Tactile subscriber: tcp://{config.tactile_zmq_host}:"
+            f"{config.tactile_zmq_port} (topic=tactile)"
+        )
+        print("    Publisher is expected to run separately (e.g. on the G1).")
         print()
     print("  Window 'data_collection':")
     print("    Pane 0 (top-left):     C++ Deploy")
