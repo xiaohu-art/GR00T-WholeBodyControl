@@ -31,6 +31,7 @@ from scipy.spatial.transform import Rotation as R
 import tyro
 import zmq
 
+from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 from gear_sonic.data.exporter import Gr00tDataExporter
 from gear_sonic.data.features_sonic_vla import (
     get_features_sonic_vla,
@@ -41,7 +42,6 @@ from gear_sonic.data.features_sonic_vla import (
     get_wrist_camera_features,
     get_wrist_camera_modality_config,
 )
-from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
 from gear_sonic.utils.data_collection.keyboard_subscriber import ZMQKeyboardSubscriber
 from gear_sonic.utils.data_collection.telemetry import Telemetry
@@ -73,7 +73,6 @@ class SonicDataExporterConfig:
 
     data_collection_frequency: int = 50
     """Data collection frequency (Hz)."""
-
 
     # Camera
     camera_host: str = "localhost"
@@ -281,6 +280,7 @@ class GrootDataCollector:
 
         self._sonic_zmq_ctx = None
         self._sonic_zmq_socket = None
+        self._manager_zmq_socket = None
         try:
             self._sonic_zmq_ctx = zmq.Context()
             self._sonic_zmq_socket = self._sonic_zmq_ctx.socket(zmq.SUB)
@@ -290,13 +290,24 @@ class GrootDataCollector:
             self._sonic_zmq_socket.setsockopt(zmq.RCVHWM, 20)
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "pose")
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "planner")
-            self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "manager_state")
+
+            # manager_state carries the momentary recording start/stop toggles.
+            # It gets its OWN socket, isolated from the high-rate pose/planner
+            # stream, so a toggle message can't be evicted by a pose backlog when
+            # the loop stalls. RCVHWM is set before connect() so it takes effect;
+            # the topic is low-rate, so a modest buffer is more than enough.
+            self._manager_zmq_socket = self._sonic_zmq_ctx.socket(zmq.SUB)
+            self._manager_zmq_socket.setsockopt(zmq.RCVHWM, 1000)
+            self._manager_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "manager_state")
+            self._manager_zmq_socket.connect(f"tcp://{sonic_data_zmq_host}:{sonic_data_zmq_port}")
+
             time.sleep(0.5)
             print(f"[Sonic] Connected to ZMQ at {sonic_data_zmq_host}:{sonic_data_zmq_port}")
-            print("[Sonic] Subscribed to: pose, planner, manager_state")
+            print("[Sonic] Subscribed to: pose, planner (manager_state on its own socket)")
         except Exception as e:
             print(f"[Sonic] Warning: Failed to initialize ZMQ subscriber: {e}")
             self._sonic_zmq_socket = None
+            self._manager_zmq_socket = None
 
         self._tactile_zmq_ctx = None
         self._tactile_zmq_socket = None
@@ -304,12 +315,18 @@ class GrootDataCollector:
             try:
                 self._tactile_zmq_ctx = zmq.Context()
                 self._tactile_zmq_socket = self._tactile_zmq_ctx.socket(zmq.SUB)
-                self._tactile_zmq_socket.connect(
-                    f"tcp://{tactile_zmq_host}:{tactile_zmq_port}"
-                )
-                self._tactile_zmq_socket.setsockopt(zmq.RCVTIMEO, 100)
-                self._tactile_zmq_socket.setsockopt(zmq.CONFLATE, 1)
+                # Do NOT use ZMQ_CONFLATE: the publisher sends multi-part
+                # messages ([topic, header, payload]) and CONFLATE does not
+                # support multi-part (it aborts libzmq). We stay real-time by
+                # draining the queue to the latest frame on every poll instead.
+                # RCVHWM is generous and set before connect() so it takes
+                # effect: when the exporter loop stalls, the whole backlog is
+                # retained so the next drain still recovers the newest frame.
+                # A small HWM would drop the newest frames at the cap and leave
+                # the drain landing on a stale one.
+                self._tactile_zmq_socket.setsockopt(zmq.RCVHWM, 1000)
                 self._tactile_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "tactile")
+                self._tactile_zmq_socket.connect(f"tcp://{tactile_zmq_host}:{tactile_zmq_port}")
                 time.sleep(0.2)
                 print(
                     f"[Tactile] Subscribed to {tactile_zmq_host}:{tactile_zmq_port} (topic=tactile)"
@@ -350,24 +367,34 @@ class GrootDataCollector:
         self.latest_proprio_msg = msg
 
     def _poll_tactile_zmq(self):
-        """Poll the ``tactile`` ZMQ topic (non-blocking, CONFLATE keeps latest only)."""
+        """Drain the ``tactile`` ZMQ topic, keeping only the most recent frame.
+
+        The publisher sends multi-part messages, so ZMQ_CONFLATE cannot be used
+        to keep just the latest. Instead we empty the socket queue every poll:
+        a stall that backs up frames is cleared in a single pass, so the
+        recorded frame never lags behind the live stream.
+        """
         if self._tactile_zmq_socket is None:
             return
+        latest = None
+        while True:
+            try:
+                parts = self._tactile_zmq_socket.recv_multipart(zmq.NOBLOCK)
+            except zmq.Again:
+                break
+            except Exception as e:
+                print(f"[Tactile] recv error: {e}")
+                break
+            if len(parts) == 3 and parts[0] == b"tactile":
+                latest = parts
+        if latest is None:
+            return
         try:
-            parts = self._tactile_zmq_socket.recv_multipart(zmq.NOBLOCK)
-        except zmq.Again:
-            return
-        except Exception as e:
-            print(f"[Tactile] recv error: {e}")
-            return
-        if len(parts) != 3 or parts[0] != b"tactile":
-            return
-        try:
-            header = msgpack.unpackb(parts[1], raw=False)
+            header = msgpack.unpackb(latest[1], raw=False)
         except Exception as e:
             print(f"[Tactile] msgpack decode error: {e}")
             return
-        payload = np.frombuffer(parts[2], dtype=np.uint8)
+        payload = np.frombuffer(latest[2], dtype=np.uint8)
         if payload.shape != (256,):
             return
         self.latest_tactile_msg = {
@@ -405,8 +432,27 @@ class GrootDataCollector:
                 self._initial_yaw = None
                 self._print_and_say("Discarded episode", blocking=False)
 
+    def _poll_manager_state_zmq(self):
+        """Fully drain the dedicated manager_state socket (non-blocking).
+
+        manager_state carries the momentary recording start/stop toggles. Its
+        socket is isolated from the high-rate pose/planner stream and drained
+        without a cap, so a press is never lost to a backlog.
+        """
+        if self._manager_zmq_socket is None:
+            return
+        while True:
+            try:
+                raw = self._manager_zmq_socket.recv(zmq.NOBLOCK)
+            except zmq.Again:
+                break
+            if raw.startswith(b"manager_state"):
+                self._handle_manager_state(raw)
+
     def _poll_sonic_zmq_messages(self):
-        """Poll ZMQ for pose, planner, and manager_state messages (non-blocking)."""
+        """Poll ZMQ for pose and planner messages (non-blocking)."""
+        self._poll_manager_state_zmq()
+
         if self._sonic_zmq_socket is None:
             return
 
@@ -417,9 +463,7 @@ class GrootDataCollector:
             except zmq.Again:
                 break
 
-            if raw.startswith(b"manager_state"):
-                self._handle_manager_state(raw)
-            elif raw.startswith(b"planner"):
+            if raw.startswith(b"planner"):
                 self._handle_planner_message(raw)
             elif raw.startswith(b"pose"):
                 self._handle_pose_message(raw)
@@ -835,20 +879,18 @@ class GrootDataCollector:
         )
 
         hand_msg = (
-            smpl_msg if self.current_stream_mode in (1, 4) and smpl_msg is not None
-            else planner_msg if planner_msg is not None
-            else smpl_msg
+            smpl_msg
+            if self.current_stream_mode in (1, 4) and smpl_msg is not None
+            else planner_msg if planner_msg is not None else smpl_msg
         )
         frame_data["teleop.left_hand_joints"] = (
             hand_msg["left_hand_joints"].astype(np.float32)
-            if hand_msg is not None
-            and hand_msg.get("left_hand_joints") is not None
+            if hand_msg is not None and hand_msg.get("left_hand_joints") is not None
             else np.zeros(7, dtype=np.float32)
         )
         frame_data["teleop.right_hand_joints"] = (
             hand_msg["right_hand_joints"].astype(np.float32)
-            if hand_msg is not None
-            and hand_msg.get("right_hand_joints") is not None
+            if hand_msg is not None and hand_msg.get("right_hand_joints") is not None
             else np.zeros(7, dtype=np.float32)
         )
 
@@ -930,7 +972,7 @@ class GrootDataCollector:
             self._state_subscriber.close()
         except Exception:
             pass
-        for sock in [self._sonic_zmq_socket, self._tactile_zmq_socket]:
+        for sock in [self._sonic_zmq_socket, self._manager_zmq_socket, self._tactile_zmq_socket]:
             if sock is not None:
                 try:
                     sock.close()

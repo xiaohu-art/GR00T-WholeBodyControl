@@ -49,12 +49,11 @@ def make_header(raw_only: bool) -> list[str]:
     return header
 
 
-def read_next_wb_sample(ser: Any, parser: FrameParser, assembler: SampleAssembler):
+def iter_wb_samples(ser: Any, parser: FrameParser, assembler: SampleAssembler):
     while True:
-        chunk = ser.read(4096)
+        chunk = ser.read(ser.in_waiting or 4096)
         if not chunk:
             continue
-
         received_at = time.time()
         for packet in parser.feed(chunk):
             sample = assembler.add_packet(packet, received_at)
@@ -63,7 +62,7 @@ def read_next_wb_sample(ser: Any, parser: FrameParser, assembler: SampleAssemble
             if sample.sensor_name != "WB":
                 print(f"跳过非衣服数据帧：{sample.sensor_name}", file=sys.stderr)
                 continue
-            return sample
+            yield sample
 
 
 def calibrate(ser: Any, sample_count: int) -> list[float]:
@@ -72,11 +71,12 @@ def calibrate(ser: Any, sample_count: int) -> list[float]:
 
     parser = FrameParser()
     assembler = SampleAssembler()
+    samples = iter_wb_samples(ser, parser, assembler)
     sums = [0.0] * 256
 
     print(f"校准中：请保持皮肤衣静止且不要按压，采集 {sample_count} 帧零点...", file=sys.stderr)
     for idx in range(sample_count):
-        sample = read_next_wb_sample(ser, parser, assembler)
+        sample = next(samples)
         for raw_index, value in enumerate(sample.raw):
             sums[raw_index] += value
         if (idx + 1) % 20 == 0 or idx + 1 == sample_count:
@@ -169,13 +169,12 @@ def main() -> int:
 
                 print(f"开始采集：port={args.port}, baud={args.baud}, csv={out}", file=sys.stderr)
                 print(f"校准文件：{calibration_file}", file=sys.stderr)
-                while True:
+                for sample in iter_wb_samples(ser, parser, assembler):
                     if args.duration and time.monotonic() - start >= args.duration:
                         break
                     if args.max_samples and sample_count >= args.max_samples:
                         break
 
-                    sample = read_next_wb_sample(ser, parser, assembler)
                     calibrated_raw = apply_calibration(sample.raw, baseline)
                     writer.writerow(sample_to_row(sample, calibrated_raw, args.raw_only))
                     if jsonl_file:

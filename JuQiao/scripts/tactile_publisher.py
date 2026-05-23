@@ -24,6 +24,7 @@ import signal
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -31,13 +32,53 @@ if str(ROOT) not in sys.path:
 
 from jq_tactile_skin.protocol import FrameParser, SampleAssembler  # noqa: E402
 
-# Reuse the existing calibration / read helpers from collect_serial.py rather
-# than duplicating them — they're already battle-tested.
-from collect_serial import (  # noqa: E402
-    apply_calibration,
-    calibrate,
-    read_next_wb_sample,
-)
+
+# Calibration / serial-read helpers are intentionally inlined here (rather than
+# imported from collect_serial.py) so this publisher is self-contained: it can
+# be copied to the G1 on its own and only depends on jq_tactile_skin/.
+def iter_wb_samples(ser: Any, parser: FrameParser, assembler: SampleAssembler):
+    """Yield assembled 256-byte WB samples from a serial-like byte stream."""
+    while True:
+        chunk = ser.read(ser.in_waiting or 4096)
+        if not chunk:
+            continue
+        received_at = time.time()
+        for packet in parser.feed(chunk):
+            sample = assembler.add_packet(packet, received_at)
+            if sample is None:
+                continue
+            if sample.sensor_name != "WB":
+                print(f"跳过非衣服数据帧：{sample.sensor_name}", file=sys.stderr)
+                continue
+            yield sample
+
+
+def calibrate(ser: Any, sample_count: int) -> list[float]:
+    """Average ``sample_count`` idle frames into a per-channel zero baseline."""
+    if sample_count <= 0:
+        raise SystemExit("--calibration-samples 必须大于 0；每次采集开始前都需要校准")
+
+    parser = FrameParser()
+    assembler = SampleAssembler()
+    samples = iter_wb_samples(ser, parser, assembler)
+    sums = [0.0] * 256
+
+    print(f"校准中：请保持皮肤衣静止且不要按压，采集 {sample_count} 帧零点...", file=sys.stderr)
+    for idx in range(sample_count):
+        sample = next(samples)
+        for raw_index, value in enumerate(sample.raw):
+            sums[raw_index] += value
+        if (idx + 1) % 20 == 0 or idx + 1 == sample_count:
+            print(f"校准进度：{idx + 1}/{sample_count}", file=sys.stderr)
+
+    baseline = [value / sample_count for value in sums]
+    print("校准完成，开始正式采集。", file=sys.stderr)
+    return baseline
+
+
+def apply_calibration(raw: bytes, baseline: list[float]) -> list[int]:
+    """Subtract the baseline from a raw frame, clamping negative values to zero."""
+    return [max(0, int(round(value - baseline[index]))) for index, value in enumerate(raw)]
 
 
 def parse_args() -> argparse.Namespace:
@@ -114,8 +155,9 @@ def main() -> int:
             parser = FrameParser()
             assembler = SampleAssembler()
 
-            while not stop["flag"]:
-                sample = read_next_wb_sample(ser, parser, assembler)
+            for sample in iter_wb_samples(ser, parser, assembler):
+                if stop["flag"]:
+                    break
                 calibrated = apply_calibration(sample.raw, baseline)
                 payload = bytes(calibrated)
                 header = msgpack.packb(
