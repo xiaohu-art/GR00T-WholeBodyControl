@@ -17,17 +17,19 @@ python gear_sonic/scripts/run_camera_viewer.py --camera-host 192.168.123.164 --c
 
 ### juqiao皮肤衣服连接
 
-g1端运行代码
+新硬件为3个独立USB设备:短袖 + 左臂 + 右臂。g1端运行代码(三个串口顺序无所谓，脚本按类型字节自动识别；三台必须全部插上，否则报错退出)
 
 ```bash
 cd JuQiao
 python3 scripts/tactile_publisher.py \
-    --port /dev/ttyACM0 \
+    --ports /dev/ttyACM0,/dev/ttyACM1,/dev/ttyACM2 \
     --zmq-host 0.0.0.0 \
     --zmq-port 5558
 ```
 
-主机端可视化验证
+发布三个topic(`tactile.vest` / `tactile.left_arm` / `tactile.right_arm`)到同一端口。查看串口：`ls /dev/ttyACM*`
+
+主机端可视化验证(一个socket收全三路，弹出三个窗口)
 
 ```bash
 .venv_data_collection/bin/python gear_sonic/scripts/run_tactile_viewer.py \

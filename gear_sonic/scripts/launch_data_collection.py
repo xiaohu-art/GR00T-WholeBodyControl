@@ -143,7 +143,7 @@ class DataCollectionLaunchConfig:
     # PUB on tcp://<host>:<port>. The launcher only configures the subscriber
     # side of the data exporter.
     record_tactile: bool = False
-    """Subscribe to a JuQiao tactile publisher and record observation.tactile_raw."""
+    """Subscribe to the JuQiao tactile publisher and record the 3 devices (vest/left_arm/right_arm)."""
 
     tactile_zmq_host: str = "localhost"
     """ZMQ host the tactile publisher is bound to (e.g. the G1's IP)."""
@@ -443,7 +443,7 @@ def main(config: DataCollectionLaunchConfig):
     if config.record_tactile:
         print(
             f"  Tactile subscriber: tcp://{config.tactile_zmq_host}:"
-            f"{config.tactile_zmq_port} (topic=tactile)"
+            f"{config.tactile_zmq_port} (topic prefix 'tactile' -> vest/left_arm/right_arm)"
         )
         print("    Publisher is expected to run separately (e.g. on the G1).")
         print()

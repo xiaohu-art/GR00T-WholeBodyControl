@@ -104,7 +104,7 @@ class SonicDataExporterConfig:
 
     # ZMQ: JuQiao tactile skin suit (from tactile_publisher.py)
     record_tactile: bool = False
-    """Record JuQiao tactile skin suit stream (observation.tactile_raw)."""
+    """Record the 3-device JuQiao tactile suit (observation.tactile_{vest,left_arm,right_arm})."""
 
     tactile_zmq_host: str = "localhost"
     """ZMQ host for tactile publisher."""
@@ -263,7 +263,16 @@ class GrootDataCollector:
         self.latest_proprio_msg = None
         self.latest_sonic_msg = None
         self.latest_planner_msg = None
-        self.latest_tactile_msg = None
+        # 3-device tactile suit: keep the latest frame per device, keyed by the
+        # publisher's per-device topic. Missing/stale devices are zero-filled
+        # independently at record time.
+        self.latest_tactile_msgs: dict = {}
+        self._tactile_devices = ("vest", "left_arm", "right_arm")
+        self._tactile_topic_to_device = {
+            b"tactile.vest": "vest",
+            b"tactile.left_arm": "left_arm",
+            b"tactile.right_arm": "right_arm",
+        }
 
         self.record_tactile = record_tactile
         self.tactile_max_age_sec = tactile_max_age_sec
@@ -329,7 +338,8 @@ class GrootDataCollector:
                 self._tactile_zmq_socket.connect(f"tcp://{tactile_zmq_host}:{tactile_zmq_port}")
                 time.sleep(0.2)
                 print(
-                    f"[Tactile] Subscribed to {tactile_zmq_host}:{tactile_zmq_port} (topic=tactile)"
+                    f"[Tactile] Subscribed to {tactile_zmq_host}:{tactile_zmq_port} "
+                    "(topic prefix 'tactile' -> vest / left_arm / right_arm)"
                 )
             except Exception as e:
                 print(f"[Tactile] Warning: failed to init ZMQ subscriber: {e}")
@@ -367,16 +377,17 @@ class GrootDataCollector:
         self.latest_proprio_msg = msg
 
     def _poll_tactile_zmq(self):
-        """Drain the ``tactile`` ZMQ topic, keeping only the most recent frame.
+        """Drain the tactile topics, keeping the most recent frame per device.
 
-        The publisher sends multi-part messages, so ZMQ_CONFLATE cannot be used
-        to keep just the latest. Instead we empty the socket queue every poll:
-        a stall that backs up frames is cleared in a single pass, so the
+        The publisher fans out one topic per device (``tactile.vest`` /
+        ``tactile.left_arm`` / ``tactile.right_arm``). ZMQ_CONFLATE cannot be
+        used (multi-part messages), so we empty the socket queue every poll:
+        a stall that backs up frames is cleared in a single pass, so each
         recorded frame never lags behind the live stream.
         """
         if self._tactile_zmq_socket is None:
             return
-        latest = None
+        latest: dict = {}
         while True:
             try:
                 parts = self._tactile_zmq_socket.recv_multipart(zmq.NOBLOCK)
@@ -385,23 +396,24 @@ class GrootDataCollector:
             except Exception as e:
                 print(f"[Tactile] recv error: {e}")
                 break
-            if len(parts) == 3 and parts[0] == b"tactile":
-                latest = parts
-        if latest is None:
-            return
-        try:
-            header = msgpack.unpackb(latest[1], raw=False)
-        except Exception as e:
-            print(f"[Tactile] msgpack decode error: {e}")
-            return
-        payload = np.frombuffer(latest[2], dtype=np.uint8)
-        if payload.shape != (256,):
-            return
-        self.latest_tactile_msg = {
-            "receive_timestamp": time.time(),
-            "host_time": float(header.get("host_time", 0.0)),
-            "raw": payload,
-        }
+            if len(parts) == 3:
+                device = self._tactile_topic_to_device.get(parts[0])
+                if device is not None:
+                    latest[device] = parts
+        for device, parts in latest.items():
+            try:
+                header = msgpack.unpackb(parts[1], raw=False)
+            except Exception as e:
+                print(f"[Tactile] msgpack decode error: {e}")
+                continue
+            payload = np.frombuffer(parts[2], dtype=np.uint8)
+            if payload.shape != (256,):
+                continue
+            self.latest_tactile_msgs[device] = {
+                "receive_timestamp": time.time(),
+                "host_time": float(header.get("host_time", 0.0)),
+                "raw": payload,
+            }
 
     def _check_recording_commands(self):
         """Check keyboard + ZMQ toggle flags for recording commands."""
@@ -734,16 +746,19 @@ class GrootDataCollector:
         return self._finalize_frame(t_start)
 
     def _add_tactile_to_frame_data(self, frame_data: dict) -> None:
-        """Populate observation.tactile_raw, zero-filling if no fresh sample."""
-        tactile_msg = self.latest_tactile_msg
-        if tactile_msg is None:
-            frame_data["observation.tactile_raw"] = np.zeros(256, dtype=np.uint8)
-            return
-        age_sec = time.time() - tactile_msg["receive_timestamp"]
-        if age_sec > self.tactile_max_age_sec:
-            frame_data["observation.tactile_raw"] = np.zeros(256, dtype=np.uint8)
-            return
-        frame_data["observation.tactile_raw"] = tactile_msg["raw"]
+        """Populate observation.tactile_{vest,left_arm,right_arm}.
+
+        Each device is zero-filled independently if its latest frame is missing
+        or older than ``tactile_max_age_sec``.
+        """
+        now = time.time()
+        for device in self._tactile_devices:
+            key = f"observation.tactile_{device}"
+            msg = self.latest_tactile_msgs.get(device)
+            if msg is None or (now - msg["receive_timestamp"]) > self.tactile_max_age_sec:
+                frame_data[key] = np.zeros(256, dtype=np.uint8)
+            else:
+                frame_data[key] = msg["raw"]
 
     def _add_cpp_state_features(self, frame_data: dict, proprio: dict) -> None:
         if "base_quat" in proprio:

@@ -395,22 +395,32 @@ def get_wrist_camera_modality_config() -> dict:
     }
 
 
+_TACTILE_DEVICES = ("vest", "left_arm", "right_arm")
+
+
 def get_tactile_features() -> dict:
-    """Features for optional JuQiao tactile skin suit (added when ``record_tactile``)."""
+    """Features for the optional 3-device JuQiao tactile suit.
+
+    Added when ``record_tactile`` is set: one 256-channel raw array per device
+    (short-sleeve vest + left/right arm sleeves).
+    """
+    names = [f"raw_{i:03d}" for i in range(1, 257)]
     return {
-        "observation.tactile_raw": {
+        f"observation.tactile_{device}": {
             "dtype": "uint8",
             "shape": (256,),
-            "names": [f"raw_{i:03d}" for i in range(1, 257)],
-        },
+            "names": list(names),
+        }
+        for device in _TACTILE_DEVICES
     }
 
 
 def get_tactile_modality_config() -> dict:
-    """Modality config entries for optional tactile skin suit."""
+    """Modality config entries for the optional 3-device tactile suit."""
     return {
         "tactile": {
-            "tactile_raw": {"original_key": "observation.tactile_raw"},
+            device: {"original_key": f"observation.tactile_{device}"}
+            for device in _TACTILE_DEVICES
         },
     }
 

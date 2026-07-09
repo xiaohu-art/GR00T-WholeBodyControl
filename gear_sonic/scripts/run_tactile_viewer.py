@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Live OpenCV viewer for the JuQiao tactile skin ZMQ stream.
+"""Live OpenCV viewer for the 3-device JuQiao tactile skin ZMQ stream.
 
-Subscribes to the same ``tactile`` ZMQ topic that ``tactile_publisher.py``
-publishes (and that ``run_data_exporter.py`` records), and renders each frame in
-real time using the body-region layout from ``visualize_tactile.py``.
+Subscribes to the ``tactile`` topic prefix that ``tactile_publisher.py``
+publishes (and that ``run_data_exporter.py`` records) and renders each device
+in its own window in real time:
+
+    tactile.vest      -> body-region layout (reused from visualize_tactile.py)
+    tactile.left_arm  -> 16x16 grid
+    tactile.right_arm -> 16x16 grid
 
 This viewer is read-only: a ZMQ PUB socket fans out to every SUB independently,
 so running it alongside the data exporter does not steal frames or otherwise
-affect recording.
+affect recording. It is meant for connectivity verification — confirm all three
+devices stream and that pressing a body part lights up the matching window.
 
 Usage (from repo root):
     .venv_data_collection/bin/python gear_sonic/scripts/run_tactile_viewer.py \
@@ -30,7 +35,26 @@ import zmq
 SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
-from visualize_tactile import CANVAS_BG, TACTILE_DIM, _compose_frame  # noqa: E402
+from visualize_tactile import (  # noqa: E402
+    CANVAS_BG,
+    TACTILE_DIM,
+    _compose_frame,
+    _put_label,
+    _render_region,
+)
+
+# Per-device topic -> device name.
+TOPIC_TO_DEVICE = {
+    b"tactile.vest": "vest",
+    b"tactile.left_arm": "left_arm",
+    b"tactile.right_arm": "right_arm",
+}
+DEVICES = ("vest", "left_arm", "right_arm")
+
+# Arm sleeve raw-channel order -> 16x16 grid (spec "手臂分区1: 从左到右"):
+# channels 129..256 then 1..128, here 0-based.
+ARM_ORDER = np.array(list(range(128, 256)) + list(range(0, 128)), dtype=np.int32)
+ARM_CELL_PX = 22
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,19 +67,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tactile-zmq-port", type=int, default=5558, help="Tactile publisher ZMQ port."
     )
-    parser.add_argument("--topic", default="tactile", help="ZMQ topic name.")
-    parser.add_argument("--window", default="tactile (live)", help="OpenCV window title.")
+    parser.add_argument("--topic", default="tactile", help="ZMQ topic prefix.")
+    parser.add_argument("--window", default="tactile", help="OpenCV window title prefix.")
     parser.add_argument(
         "--history",
         type=int,
         default=400,
-        help="Frames of activity history shown in the timeline strip.",
+        help="Frames of activity history shown in the vest timeline strip.",
     )
     parser.add_argument(
         "--stale-sec",
         type=float,
         default=0.5,
-        help="Mark the view STALE if no frame arrives within this many seconds.",
+        help="Mark a view STALE if no frame arrives within this many seconds.",
     )
     return parser.parse_args()
 
@@ -69,88 +93,112 @@ def _status_canvas(text: str) -> np.ndarray:
     return canvas
 
 
+def _arm_canvas(frame: np.ndarray, device: str, vmax: int, status: str) -> np.ndarray:
+    """Render an arm frame as a labeled 16x16 heatmap canvas."""
+    grid = frame[ARM_ORDER].reshape(16, 16)
+    body = _render_region(grid, ARM_CELL_PX, vmax)
+    h, w = body.shape[:2]
+    canvas = np.full((h + 50, max(w, 360), 3), CANVAS_BG, dtype=np.uint8)
+    _put_label(canvas, f"{device}  16x16", 6, 20)
+    canvas[28 : 28 + h, 0:w] = body
+    cv2.putText(
+        canvas, status, (6, canvas.shape[0] - 6),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.44, (170, 170, 170), 1, cv2.LINE_AA,
+    )
+    return canvas
+
+
+class DeviceView:
+    def __init__(self, device: str, window: str, history: int) -> None:
+        self.device = device
+        self.window = window
+        self.last_frame: np.ndarray | None = None
+        self.last_recv = 0.0
+        self.rx_count = 0
+        self.n_new = 0
+        self.fps_ema = 0.0
+        self.prev_t: float | None = None
+        self.history: deque[int] = deque(maxlen=max(history, 2))
+        cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE)
+
+    def update(self, payload: np.ndarray, n_new: int) -> None:
+        now = time.time()
+        if self.prev_t is not None and now > self.prev_t:
+            inst = n_new / (now - self.prev_t)
+            self.fps_ema = inst if self.fps_ema == 0.0 else 0.9 * self.fps_ema + 0.1 * inst
+        self.prev_t = now
+        self.last_frame = payload
+        self.last_recv = now
+        self.rx_count += n_new
+        self.history.append(int(payload.max()))
+
+    def render(self, endpoint: str, stale_sec: float) -> None:
+        if self.last_frame is None:
+            canvas = _status_canvas(f"waiting for {self.device} on {endpoint} ...")
+            cv2.imshow(self.window, canvas)
+            return
+        age = time.time() - self.last_recv
+        series = np.asarray(self.history, dtype=np.int64)
+        vmax = max(int(series.max()), 1)
+        status = (
+            f"LIVE {self.fps_ema:4.1f}fps  rx={self.rx_count}  "
+            f"age={age * 1000:4.0f}ms  vmax={vmax}"
+        )
+        if age > stale_sec:
+            status += "  [STALE]"
+        if self.device == "vest":
+            canvas = _compose_frame(
+                self.last_frame, vmax, len(self.history) - 1, len(self.history), False, series
+            )
+            cv2.putText(
+                canvas, status, (14, canvas.shape[0] - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.44, (170, 170, 170), 1, cv2.LINE_AA,
+            )
+        else:
+            canvas = _arm_canvas(self.last_frame, self.device, vmax, status)
+        cv2.imshow(self.window, canvas)
+
+
 def main() -> int:
     args = parse_args()
     endpoint = f"tcp://{args.tactile_zmq_host}:{args.tactile_zmq_port}"
-    topic_bytes = args.topic.encode("utf-8")
 
     ctx = zmq.Context()
     sock = ctx.socket(zmq.SUB)
-    # Do NOT use ZMQ_CONFLATE here: the publisher sends multi-part messages
-    # ([topic, header, payload]) and CONFLATE does not support multi-part — it
-    # aborts libzmq ("Assertion failed: !_more"). We stay real-time by draining
-    # to the latest frame every loop instead. A small RCVHWM (set before
-    # connect, so it takes effect) caps the backlog if rendering ever stalls.
-    sock.setsockopt(zmq.RCVHWM, 10)
-    sock.setsockopt_string(zmq.SUBSCRIBE, args.topic)
+    # Do NOT use ZMQ_CONFLATE: the publisher sends multi-part messages and
+    # CONFLATE aborts libzmq on multi-part. Stay real-time by draining to the
+    # latest frame per device every loop instead.
+    sock.setsockopt(zmq.RCVHWM, 30)
+    sock.setsockopt_string(zmq.SUBSCRIBE, args.topic)  # prefix -> all 3 topics
     sock.connect(endpoint)
-    print(f"[tactile-viewer] SUB connected to {endpoint} (topic={args.topic!r})")
+    print(f"[tactile-viewer] SUB connected to {endpoint} (topic prefix={args.topic!r})")
     print("[tactile-viewer] keys: q / ESC to quit")
 
-    history: deque[int] = deque(maxlen=max(args.history, 2))
-    last_frame: np.ndarray | None = None
-    last_recv = 0.0
-    rx_count = 0
-    fps_ema = 0.0
-    prev_t: float | None = None
+    views = {dev: DeviceView(dev, f"{args.window}: {dev}", args.history) for dev in DEVICES}
 
-    cv2.namedWindow(args.window, cv2.WINDOW_AUTOSIZE)
     try:
         while True:
-            # Drain everything queued; keep the most recent frame for display,
-            # but count every frame so the reported rate is the true incoming
-            # stream rate, not just the viewer's (slower) redraw rate.
-            latest = None
-            n_new = 0
+            latest: dict = {}
+            counts: dict = {}
             while True:
                 try:
                     parts = sock.recv_multipart(zmq.NOBLOCK)
                 except zmq.Again:
                     break
-                if len(parts) == 3 and parts[0] == topic_bytes:
-                    latest = parts[2]
-                    n_new += 1
+                if len(parts) == 3:
+                    device = TOPIC_TO_DEVICE.get(parts[0])
+                    if device is not None:
+                        latest[device] = parts[2]
+                        counts[device] = counts.get(device, 0) + 1
 
-            if latest is not None:
-                payload = np.frombuffer(latest, dtype=np.uint8)
+            for device, raw in latest.items():
+                payload = np.frombuffer(raw, dtype=np.uint8)
                 if payload.shape == (TACTILE_DIM,):
-                    now = time.time()
-                    if prev_t is not None and now > prev_t:
-                        inst = n_new / (now - prev_t)
-                        fps_ema = inst if fps_ema == 0.0 else 0.9 * fps_ema + 0.1 * inst
-                    prev_t = now
-                    last_frame = payload
-                    last_recv = now
-                    rx_count += n_new
-                    history.append(int(payload.max()))
+                    views[device].update(payload, counts[device])
 
-            if last_frame is None:
-                canvas = _status_canvas(f"waiting for tactile data on {endpoint} ...")
-            else:
-                age = time.time() - last_recv
-                series = np.asarray(history, dtype=np.int64)
-                vmax = max(int(series.max()), 1)
-                canvas = _compose_frame(
-                    last_frame, vmax, len(history) - 1, len(history), False, series
-                )
-                status = (
-                    f"LIVE  {fps_ema:4.1f} fps   rx={rx_count}   "
-                    f"age={age * 1000:4.0f}ms   vmax={vmax}"
-                )
-                if age > args.stale_sec:
-                    status += "   [STALE]"
-                cv2.putText(
-                    canvas,
-                    status,
-                    (14, canvas.shape[0] - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.44,
-                    (170, 170, 170),
-                    1,
-                    cv2.LINE_AA,
-                )
+            for view in views.values():
+                view.render(endpoint, args.stale_sec)
 
-            cv2.imshow(args.window, canvas)
             if (cv2.waitKey(15) & 0xFFFF) in (ord("q"), 27):
                 break
     except KeyboardInterrupt:
@@ -159,7 +207,8 @@ def main() -> int:
         cv2.destroyAllWindows()
         sock.close()
         ctx.term()
-        print(f"[tactile-viewer] shutdown, received {rx_count} frames")
+        total = sum(v.rx_count for v in views.values())
+        print(f"[tactile-viewer] shutdown, received {total} frames total")
     return 0
 
 

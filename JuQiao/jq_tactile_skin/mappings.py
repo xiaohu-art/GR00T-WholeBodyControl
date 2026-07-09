@@ -70,3 +70,26 @@ REGIONS = [
         indices=[249, 233, 217, 201],
     ),
 ]
+
+
+# Arm sleeve (缠绕式手臂, JQGY-YL-132): the full 256-channel array is used as a
+# single 16x16 grid. Per the spec's "手臂分区1传感点：从左到右" table, the raw
+# channel order fills the grid as 129..256 then 1..128. Left and right arms are
+# the same model / physical layout, so they share this mapping — only their
+# source device stream differs.
+ARM_REGION = RegionSpec(
+    key="arm",
+    title="手臂",
+    cols=16,
+    rows=16,
+    indices=list(range(129, 257)) + list(range(1, 129)),
+)
+
+
+# Regions grouped by device, for viewers / offline analysis. ``vest`` reuses the
+# short-sleeve body regions above; each arm is one 16x16 grid.
+REGIONS_BY_DEVICE = {
+    "vest": REGIONS,
+    "left_arm": [ARM_REGION],
+    "right_arm": [ARM_REGION],
+}

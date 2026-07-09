@@ -11,8 +11,30 @@ PACKET1_LEN = len(HEADER) + 2 + PACKET1_DATA_LEN
 PACKET2_LEN = len(HEADER) + 2 + PACKET2_DATA_LEN
 
 SENSOR_TYPES = {
-    0x05: "WB",
+    0x01: "LEFT_ARM",
+    0x02: "RIGHT_ARM",
+    0x05: "VEST",
 }
+
+# Single source of truth for the 3-device (清华 V1.0) tactile suit:
+# each physical USB stream self-identifies via its sensor-type byte, so the
+# publisher can auto-route a serial port to a device without relying on the
+# (unstable) USB enumeration order.
+DEVICE_BY_SENSOR_TYPE = {
+    0x05: "vest",
+    0x01: "left_arm",
+    0x02: "right_arm",
+}
+EXPECTED_DEVICES = frozenset(DEVICE_BY_SENSOR_TYPE.values())
+
+# ZMQ topic per device. Downstream subscribes to the ``TOPIC_PREFIX`` prefix
+# (ZMQ prefix matching) to receive all three in one connection, then routes by
+# the full topic.
+TOPIC_PREFIX = "tactile"
+
+
+def topic_for_device(device: str, prefix: str = TOPIC_PREFIX) -> str:
+    return f"{prefix}.{device}"
 
 
 @dataclass(frozen=True)
