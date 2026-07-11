@@ -12,7 +12,12 @@ Usage (on robot)::
         --port 5555
 
 Supported camera types: ``oak``, ``oak_mono``, ``realsense``,
-``usb``, or a path to an ``.mp4`` file for replay testing.
+``usb``, ``usb_stereo``, or a path to an ``.mp4`` file for replay testing.
+
+``usb_stereo`` is for side-by-side stereo UVC cameras (single device that
+exposes both eyes packed into one wide frame). It defaults to
+2560x720 @ 60 fps with MJPG, and emits two mount keys
+``<mount_position>_left`` / ``<mount_position>_right``.
 
 Run ``python -m gear_sonic.camera.composed_camera --help`` for all options.
 """
@@ -390,6 +395,25 @@ class ComposedCameraSensor(Sensor, SensorServer):
             usb_config = USBCameraConfig()
             device_idx = int(device_id) if device_id else 0
             print(f"Initializing USB camera for type: {camera_type}, device: {device_idx}")
+            return USBCameraSensor(
+                config=usb_config, mount_position=mount_position, device_index=device_idx
+            )
+
+        elif camera_type == "usb_stereo":
+            from gear_sonic.camera.drivers.usb_camera import USBCameraConfig, USBCameraSensor
+
+            usb_config = USBCameraConfig()
+            # USB 2.0 stable combo: side-by-side 1280x480 -> 640x480 per eye @ 60fps MJPG
+            # (~5.5 MB/s, fits comfortably in USB2 isoc bandwidth, matches 50Hz exporter)
+            usb_config.image_dim = (1280, 480)
+            usb_config.fps = 60
+            usb_config.stereo = True
+            usb_config.use_mjpeg = True
+            device_idx = int(device_id) if device_id else 0
+            print(
+                f"Initializing USB stereo camera for type: {camera_type}, "
+                f"device: {device_idx}, resolution: {usb_config.image_dim}, fps: {usb_config.fps}"
+            )
             return USBCameraSensor(
                 config=usb_config, mount_position=mount_position, device_index=device_idx
             )

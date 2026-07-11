@@ -138,6 +138,10 @@ class DataCollectionLaunchConfig:
     record_wrist_cameras: bool = False
     """Record wrist camera streams (left_wrist, right_wrist) in the dataset."""
 
+    stereo_ego_view: bool = False
+    """Record stereo ego view (ego_view_left + ego_view_right) instead of monocular ego_view.
+    Requires the camera server to be started with ``--ego-view-camera usb_stereo``."""
+
     # Tactile suit (JuQiao). The publisher is expected to run separately
     # (typically on the G1 onboard PC where the USB serial device lives) and
     # PUB on tcp://<host>:<port>. The launcher only configures the subscriber
@@ -413,6 +417,8 @@ def main(config: DataCollectionLaunchConfig):
         exporter_cmd += f" --dataset-name '{config.dataset_name}'"
     if config.record_wrist_cameras:
         exporter_cmd += " --record-wrist-cameras"
+    if config.stereo_ego_view:
+        exporter_cmd += " --stereo-ego-view"
     if config.record_tactile:
         exporter_cmd += (
             f" --record-tactile"
