@@ -110,6 +110,14 @@ class InferenceConfig:
     keyboard_zmq_port: int = DEFAULT_ZMQ_KEYBOARD_PORT
     """ZMQ port for keyboard input."""
 
+    # Camera modality
+    stereo_ego_view: bool = False
+    """Feed the ego view to the policy as a stereo pair (``ego_view_left`` +
+    ``ego_view_right``) instead of a single monocular ``ego_view``. Must match
+    the modality the policy was trained with. Requires the camera server to be
+    started with ``--ego-view-camera usb_stereo`` (which publishes both
+    ``ego_view_left`` and ``ego_view_right`` image keys)."""
+
     # Embodiment
     embodiment_tag: str = "unitree_g1_sonic"
     """Embodiment tag for policy inference."""
@@ -124,6 +132,13 @@ class InferenceConfig:
     on 'i' is the per-prompt mean of first-frame ``action.motion_token`` values
     from that dataset (falling back to a global mean over all episodes, and to
     the hardcoded LATENT_INITIAL_MOTION_TOKEN if the dataset can't be loaded)."""
+
+    initial_pose_ramp_seconds: float = 1.0
+    """Duration over which to cosine-ease the motion token (and hand joints)
+    from the last sent value to the initial-pose target when 'i' is pressed.
+    Set to 0 to disable smoothing and snap directly to the target (legacy
+    behavior). Ignored on the first 'i' press of a session (no last-sent
+    value to ramp from)."""
 
     # Debug
     verbose_timing: bool = False
@@ -220,6 +235,7 @@ def prepare_observation_from_sensors(
     robot_model,
     language_prompt: str,
     log_errors: bool = False,
+    stereo_ego_view: bool = False,
 ):
     """Read sensors and prepare observation for the VLA policy.
 
@@ -238,8 +254,6 @@ def prepare_observation_from_sensors(
             print("[DEBUG] prepare_observation: waiting for state msg..", flush=True)
         return None
 
-    cam_img = camera_msg["images"]["ego_view"]
-
     # Copy index finger data to middle finger (hardware coupling)
     state_msg["left_hand_q"][5] = state_msg["left_hand_q"][3]
     state_msg["left_hand_q"][6] = state_msg["left_hand_q"][4]
@@ -250,11 +264,30 @@ def prepare_observation_from_sensors(
         right_hand_actuated_joint_values=state_msg["right_hand_q"],
     )
 
-    video = {"ego_view": cam_img[np.newaxis, np.newaxis]}
-    if "left_wrist" in camera_msg["images"]:
-        video["left_wrist"] = camera_msg["images"]["left_wrist"][np.newaxis, np.newaxis]
-    if "right_wrist" in camera_msg["images"]:
-        video["wrist_view"] = camera_msg["images"]["right_wrist"][np.newaxis, np.newaxis]
+    images = camera_msg["images"]
+    video = {}
+    if stereo_ego_view:
+        for eye_key in ("ego_view_left", "ego_view_right"):
+            if eye_key not in images:
+                if log_errors:
+                    print(
+                        f"[DEBUG] prepare_observation: stereo_ego_view set but "
+                        f"'{eye_key}' missing from camera images "
+                        f"(available: {list(images.keys())}). Is the camera server "
+                        f"running with --ego-view-camera usb_stereo?",
+                        flush=True,
+                    )
+                return None
+            video[eye_key] = images[eye_key][np.newaxis, np.newaxis]
+        ego_timestamp = camera_msg["timestamps"]["ego_view_left"]
+    else:
+        video["ego_view"] = images["ego_view"][np.newaxis, np.newaxis]
+        ego_timestamp = camera_msg["timestamps"]["ego_view"]
+
+    if "left_wrist" in images:
+        video["left_wrist"] = images["left_wrist"][np.newaxis, np.newaxis]
+    if "right_wrist" in images:
+        video["wrist_view"] = images["right_wrist"][np.newaxis, np.newaxis]
 
     observation = {
         "video": video,
@@ -263,7 +296,7 @@ def prepare_observation_from_sensors(
             "annotation.human.task_description": [[language_prompt]],
         },
         "q": np.asarray(qpos, dtype=np.float32)[np.newaxis, np.newaxis],
-        "timestamps": camera_msg["timestamps"]["ego_view"],
+        "timestamps": ego_timestamp,
     }
 
     observation = prepare_observation_for_eval(robot_model, observation)
@@ -418,6 +451,14 @@ def main(config: InferenceConfig):
     initial_pose_left_hand_closed = False
     initial_pose_right_hand_closed = False
 
+    # Last action we put on the wire — used by publish_initial_pose to ramp
+    # from the robot's current commanded pose to the initial-pose target on
+    # 'i', avoiding a one-frame snap. Remains None until the main loop has
+    # sent at least one frame.
+    last_sent_motion_token: np.ndarray | None = None
+    last_sent_left_hand_joints: np.ndarray | None = None
+    last_sent_right_hand_joints: np.ndarray | None = None
+
     # Optional dataset-derived initial poses (per-prompt average of first-frame
     # motion tokens). Falls back to LATENT_INITIAL_MOTION_TOKEN if not provided
     # or if loading fails.
@@ -440,39 +481,102 @@ def main(config: InferenceConfig):
             dataset_poses = None
 
     def publish_initial_pose():
-        """Publish initial pose command to move robot to starting position."""
+        """Publish initial pose command to move robot to starting position.
+
+        If a previous action frame has been sent and ``initial_pose_ramp_seconds
+        > 0``, cosine-ease the motion token (and hand joints) from the last
+        sent value to the target over that many seconds, one ZMQ frame per
+        ``loop_period``. Otherwise snap directly to the target in a single
+        frame (legacy behavior, used on the very first 'i' press).
+        """
+        nonlocal last_sent_motion_token
+        nonlocal last_sent_left_hand_joints
+        nonlocal last_sent_right_hand_joints
+
         print("Moving to initial pose")
-        left_hand = (
+        target_left_hand = (
             _compute_closed_hand_joints("L")
             if initial_pose_left_hand_closed
             else np.zeros(7, dtype=np.float32)
         )
-        right_hand = (
+        target_right_hand = (
             _compute_closed_hand_joints("R")
             if initial_pose_right_hand_closed
             else np.zeros(7, dtype=np.float32)
         )
 
-        motion_token = LATENT_INITIAL_MOTION_TOKEN
+        target_motion_token = np.asarray(LATENT_INITIAL_MOTION_TOKEN, dtype=np.float32)
         token_source = "hardcoded LATENT_INITIAL_MOTION_TOKEN"
         if dataset_poses is not None:
             current_prompt = language_prompt_ref[0]
             dataset_token = dataset_poses.lookup(current_prompt)
             if dataset_token is not None:
-                motion_token = dataset_token
+                target_motion_token = np.asarray(dataset_token, dtype=np.float32)
                 if current_prompt in dataset_poses.by_prompt:
                     token_source = f"dataset mean for prompt {current_prompt!r}"
                 else:
                     token_source = f"dataset global mean (prompt {current_prompt!r} not in dataset)"
 
-        zmq_message = pack_latent_action_message(
-            motion_token=motion_token,
-            frame_index=np.array([0], dtype=np.int64),
-            left_hand_joints=left_hand,
-            right_hand_joints=right_hand,
-        )
-        zmq_socket.send(zmq_message)
-        print_green(f"Sent latent initial pose via ZMQ ({token_source})")
+        ramp_seconds = float(config.initial_pose_ramp_seconds)
+        can_ramp = ramp_seconds > 0.0 and last_sent_motion_token is not None
+        if can_ramp:
+            n_steps = max(1, int(round(ramp_seconds * config.action_publish_rate)))
+            start_token = np.asarray(last_sent_motion_token, dtype=np.float32)
+            start_left = np.asarray(
+                (
+                    last_sent_left_hand_joints
+                    if last_sent_left_hand_joints is not None
+                    else target_left_hand
+                ),
+                dtype=np.float32,
+            )
+            start_right = np.asarray(
+                (
+                    last_sent_right_hand_joints
+                    if last_sent_right_hand_joints is not None
+                    else target_right_hand
+                ),
+                dtype=np.float32,
+            )
+            for i in range(1, n_steps + 1):
+                # Cosine ease (smoothstep): zero velocity at both endpoints,
+                # so the robot doesn't jerk into or out of the ramp.
+                alpha = 0.5 - 0.5 * np.cos(np.pi * (i / n_steps))
+                blended_token = ((1.0 - alpha) * start_token + alpha * target_motion_token).astype(
+                    np.float32
+                )
+                blended_left = ((1.0 - alpha) * start_left + alpha * target_left_hand).astype(
+                    np.float32
+                )
+                blended_right = ((1.0 - alpha) * start_right + alpha * target_right_hand).astype(
+                    np.float32
+                )
+                ramp_msg = pack_latent_action_message(
+                    motion_token=blended_token,
+                    frame_index=np.array([0], dtype=np.int64),
+                    left_hand_joints=blended_left,
+                    right_hand_joints=blended_right,
+                )
+                zmq_socket.send(ramp_msg)
+                time.sleep(loop_period)
+            print_green(
+                f"Sent ramped latent initial pose via ZMQ "
+                f"({n_steps} steps over {ramp_seconds:.2f}s, target: {token_source})"
+            )
+        else:
+            zmq_message = pack_latent_action_message(
+                motion_token=target_motion_token,
+                frame_index=np.array([0], dtype=np.int64),
+                left_hand_joints=target_left_hand,
+                right_hand_joints=target_right_hand,
+            )
+            zmq_socket.send(zmq_message)
+            print_green(f"Sent latent initial pose via ZMQ ({token_source})")
+
+        last_sent_motion_token = target_motion_token
+        last_sent_left_hand_joints = target_left_hand
+        last_sent_right_hand_joints = target_right_hand
+
         time.sleep(1.0)
         print("Initial pose done.")
 
@@ -602,6 +706,7 @@ def main(config: InferenceConfig):
                 robot_model=robot_model,
                 language_prompt=language_prompt_ref[0],
                 log_errors=True,
+                stereo_ego_view=config.stereo_ego_view,
             ),
             lambda obs: run_policy_inference_and_process(
                 policy=n1_policy,
@@ -707,6 +812,9 @@ def main(config: InferenceConfig):
                         right_hand_joints=right_hand_joints,
                     )
                     zmq_socket.send(zmq_message)
+                    last_sent_motion_token = motion_token
+                    last_sent_left_hand_joints = left_hand_joints
+                    last_sent_right_hand_joints = right_hand_joints
                     if zmq_frame_counter % 50 == 0:
                         print_green(
                             f"ZMQ: Sent latent action - "

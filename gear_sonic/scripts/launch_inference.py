@@ -145,6 +145,13 @@ class InferenceLaunchConfig:
     camera_port: int = 5555
     """Camera server port."""
 
+    stereo_ego_view: bool = False
+    """Feed the ego view to the policy as a stereo pair (``ego_view_left`` +
+    ``ego_view_right``) instead of a single monocular ``ego_view``. Must match
+    the modality the policy was trained with. Passed through to both the VLA
+    inference and the data exporter. Requires the (separately started) camera
+    server to be running with ``--ego-view-camera usb_stereo``."""
+
     # Data exporter (optional recording during inference)
     data_exporter: bool = True
     """Start the data exporter pane for recording during inference."""
@@ -376,6 +383,8 @@ def main(config: InferenceLaunchConfig):
         )
         if config.dataset_name:
             exporter_cmd += f" --dataset-name '{config.dataset_name}'"
+        if config.stereo_ego_view:
+            exporter_cmd += " --stereo-ego-view"
 
         print("Starting data exporter (pane 3)...")
         _send_to_pane(3, exporter_cmd, wait=2.0)
@@ -396,6 +405,8 @@ def main(config: InferenceLaunchConfig):
     )
     if config.dataset_path:
         inference_cmd += f" --dataset-path '{config.dataset_path}'"
+    if config.stereo_ego_view:
+        inference_cmd += " --stereo-ego-view"
 
     print("Starting VLA inference (pane 1)...")
     _send_to_pane(2, inference_cmd, wait=1.0)
