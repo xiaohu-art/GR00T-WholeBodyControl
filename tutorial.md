@@ -24,10 +24,14 @@ cd JuQiao
 python3 scripts/tactile_publisher.py \
     --ports /dev/ttyACM0,/dev/ttyACM1,/dev/ttyACM2 \
     --zmq-host 0.0.0.0 \
-    --zmq-port 5558
+    --zmq-port 5558 \
+    --manager-host <主机IP> \
+    --manager-port 5556
 ```
 
 发布三个topic(`tactile.vest` / `tactile.left_arm` / `tactile.right_arm`)到同一端口。查看串口：`ls /dev/ttyACM*`
+
+`--manager-host <主机IP>`(运行 PICO manager 的主机在 192.168.123.x 网段的地址)启用**在线重新校准**：数据采集过程中传感器发生漂移/挤压时，**双手 grip 同时按一下**即可让三台设备重新采零点基线(默认 50 帧，期间该设备短暂不发布)。**按下时保持触觉衣放松、不受压**，否则会把当前压力当成零点。校准在源头 publisher 完成，viewer 和采集端会同时恢复正常。不传 `--manager-host` 则禁用该功能(仅启动时校准一次)。
 
 主机端可视化验证(一个socket收全三路，弹出三个窗口)
 

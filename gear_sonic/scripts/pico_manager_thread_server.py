@@ -1900,6 +1900,9 @@ def run_pico_manager(
     vr3pt_parent_mode = StreamMode.PLANNER
     prev_toggle_dc = False
     prev_toggle_da = False
+    # Tactile re-calibration: both grips together -> edge-triggered signal that
+    # tells the (separate, G1-side) tactile publisher to re-zero its baseline.
+    prev_toggle_tactile_cal = False
     try:
         prev_ax_pressed = False
         prev_by_pressed = False
@@ -1909,7 +1912,7 @@ def run_pico_manager(
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
 
-            left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs()
+            left_menu_button, _, _, left_grip_mgr, right_grip_mgr = get_controller_inputs()
 
             left_axis_click, _ = get_axis_clicks()
 
@@ -2055,6 +2058,17 @@ def run_pico_manager(
                     topic="manager_state",
                 )
             )
+
+            # Both grips together (rising edge) -> ask the tactile publisher to
+            # re-zero. Sent as a bare, self-describing topic frame on the same
+            # PUB socket; manager_state subscribers (prefix "manager_state") do
+            # not receive it, and the G1 publisher subscribes to this prefix
+            # without having to parse the pose-message protocol.
+            toggle_tactile_cal_tmp = left_grip_mgr > 0.5 and right_grip_mgr > 0.5
+            if toggle_tactile_cal_tmp and not prev_toggle_tactile_cal:
+                socket.send(b"tactile_calibrate")
+                print("[Manager] Tactile re-calibration requested (both grips)")
+            prev_toggle_tactile_cal = toggle_tactile_cal_tmp
 
             prev_ax_pressed = ax_pressed
             prev_by_pressed = by_pressed

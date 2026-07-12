@@ -93,6 +93,7 @@ class Worker:
         self.device: str | None = None
         self.probed = threading.Event()  # set once the device type is known
         self.ready = threading.Event()  # set once calibration is done
+        self.recalibrate = threading.Event()  # set to request a live zero-point re-cal
         self.error: BaseException | None = None
         self.thread: threading.Thread | None = None
 
@@ -155,6 +156,31 @@ def _worker_main(
             for sample in samples:
                 if stop.is_set():
                     break
+
+                # Live re-calibration: when requested (e.g. operator pressed both
+                # PICO grips because the suit has drifted / crept), average the
+                # next `recalibration_samples` frames into a fresh baseline. The
+                # suit must be at rest during this short window. Frames consumed
+                # for the baseline are not published.
+                if w.recalibrate.is_set():
+                    sums2 = [float(v) for v in sample.raw]
+                    c2 = 1
+                    for s2 in samples:
+                        if stop.is_set():
+                            break
+                        for i, value in enumerate(s2.raw):
+                            sums2[i] += value
+                        c2 += 1
+                        if c2 >= args.recalibration_samples:
+                            break
+                    baseline = [s / c2 for s in sums2]
+                    w.recalibrate.clear()
+                    print(
+                        f"[tactile-pub] {device} 重新校准完成（{c2} 帧）",
+                        file=sys.stderr,
+                    )
+                    continue
+
                 calibrated = bytes(
                     max(0, int(round(value - baseline[idx])))
                     for idx, value in enumerate(sample.raw)
@@ -208,6 +234,24 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="每台设备启动时的零点校准帧数，默认 100；期间不会发布数据",
     )
+    parser.add_argument(
+        "--recalibration-samples",
+        type=int,
+        default=50,
+        help="收到重新校准信号后重采的零点帧数，默认 50；期间该设备不发布",
+    )
+    parser.add_argument(
+        "--manager-host",
+        default="",
+        help="PICO manager 的地址；设置后订阅其 'tactile_calibrate' 信号以支持在线重新校准"
+        "（双手 grip 同按触发）。留空则禁用在线重新校准。",
+    )
+    parser.add_argument(
+        "--manager-port",
+        type=int,
+        default=5556,
+        help="PICO manager 的 PUB 端口，默认 5556",
+    )
     parser.add_argument("--timeout", type=float, default=0.2, help="串口读取超时（秒）")
     parser.add_argument(
         "--warmup-sec",
@@ -260,6 +304,23 @@ def main() -> int:
     bind_endpoint = f"tcp://{args.zmq_host}:{args.zmq_port}"
     sock.bind(bind_endpoint)
     print(f"[tactile-pub] ZMQ PUB bound at {bind_endpoint}", file=sys.stderr)
+
+    # Optional: subscribe to the PICO manager's "tactile_calibrate" signal so the
+    # operator can re-zero all devices online (both grips pressed together). We
+    # only prefix-subscribe to that bare topic, so no pose-message parsing is
+    # needed and the manager_state stream is untouched.
+    cal_sock = None
+    if args.manager_host:
+        cal_sock = ctx.socket(zmq.SUB)
+        cal_sock.setsockopt(zmq.RCVHWM, 10)
+        cal_sock.setsockopt_string(zmq.SUBSCRIBE, "tactile_calibrate")
+        cal_endpoint = f"tcp://{args.manager_host}:{args.manager_port}"
+        cal_sock.connect(cal_endpoint)
+        print(
+            f"[tactile-pub] 在线重新校准已启用：SUB connected to {cal_endpoint} "
+            "(topic='tactile_calibrate')",
+            file=sys.stderr,
+        )
 
     stop = threading.Event()
 
@@ -321,6 +382,26 @@ def main() -> int:
 
         # Phase 4: drain the queue and publish (single-threaded socket access).
         while not stop.is_set():
+            # Non-blocking check for an online re-calibration request. Any frame
+            # on the subscribed topic triggers a re-zero of all three devices.
+            if cal_sock is not None:
+                got_signal = False
+                while True:
+                    try:
+                        cal_sock.recv(zmq.NOBLOCK)
+                        got_signal = True
+                    except zmq.Again:
+                        break
+                    except Exception:
+                        break
+                if got_signal:
+                    for w in workers:
+                        w.recalibrate.set()
+                    print(
+                        "[tactile-pub] 收到重新校准信号，三台设备将重新采集零点基线",
+                        file=sys.stderr,
+                    )
+
             try:
                 topic_bytes, header, payload = out_queue.get(timeout=0.2)
             except queue.Empty:
@@ -342,6 +423,11 @@ def main() -> int:
             sock.close()
         except Exception:
             pass
+        if cal_sock is not None:
+            try:
+                cal_sock.close()
+            except Exception:
+                pass
         try:
             ctx.term()
         except Exception:
