@@ -48,6 +48,7 @@ python3 scripts/tactile_publisher.py \
 ```bash
 python gear_sonic/scripts/launch_data_collection.py \
     --camera-host 192.168.123.164 \
+    --stereo-ego-view \
     --record-tactile \
     --tactile-zmq-host 192.168.123.164
 ```

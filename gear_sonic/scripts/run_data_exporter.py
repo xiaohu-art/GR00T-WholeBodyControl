@@ -102,6 +102,11 @@ class SonicDataExporterConfig:
     record_wrist_cameras: bool = False
     """Record wrist camera streams (left_wrist, right_wrist). Requires cameras to be available."""
 
+    stereo_ego_view: bool = False
+    """Record the ego_view as a stereo pair (ego_view_left + ego_view_right) instead of a single
+    monocular ego_view. Requires the camera server to be running with ``--ego-view-camera usb_stereo``
+    (or any source that publishes both ``*_left`` and ``*_right`` image keys)."""
+
     # ZMQ: JuQiao tactile skin suit (from tactile_publisher.py)
     record_tactile: bool = False
     """Record the 3-device JuQiao tactile suit (observation.tactile_{vest,left_arm,right_arm})."""
@@ -1057,8 +1062,10 @@ class GrootDataCollector:
 def main(config: SonicDataExporterConfig):
     g1_rm = get_g1_robot_model()
 
-    dataset_features = get_features_sonic_vla(g1_rm)
-    modality_config = get_modality_config_sonic_vla(g1_rm)
+    dataset_features = get_features_sonic_vla(g1_rm, stereo_ego_view=config.stereo_ego_view)
+    modality_config = get_modality_config_sonic_vla(g1_rm, stereo_ego_view=config.stereo_ego_view)
+    if config.stereo_ego_view:
+        print("[Camera] Stereo ego view enabled — recording ego_view_left + ego_view_right")
 
     if config.record_wrist_cameras:
         print("[Camera] Wrist cameras enabled — adding to dataset schema")
@@ -1096,6 +1103,7 @@ def main(config: SonicDataExporterConfig):
             **robot_config,
             "record_wrist_cameras": config.record_wrist_cameras,
             "record_tactile": config.record_tactile,
+            "stereo_ego_view": config.stereo_ego_view,
         },
     )
 

@@ -42,12 +42,23 @@ def _get_joint_group_slices(robot_model: RobotModel) -> dict[str, dict[str, int]
     return slices
 
 
-def get_modality_config_sonic_vla(robot_model: RobotModel) -> dict:
+def get_modality_config_sonic_vla(robot_model: RobotModel, stereo_ego_view: bool = False) -> dict:
     """Return the modality config for the Sonic VLA dataset.
 
     Produces the exact content of meta/modality.json.
+
+    When ``stereo_ego_view`` is set, the single monocular ``ego_view`` entry is
+    replaced by a stereo pair (``ego_view_left`` + ``ego_view_right``).
     """
     group_slices = _get_joint_group_slices(robot_model)
+
+    if stereo_ego_view:
+        ego_view_video = {
+            "ego_view_left": {"original_key": "observation.images.ego_view_left"},
+            "ego_view_right": {"original_key": "observation.images.ego_view_right"},
+        }
+    else:
+        ego_view_video = {"ego_view": {"original_key": "observation.images.ego_view"}}
 
     return {
         "state": {
@@ -194,7 +205,7 @@ def get_modality_config_sonic_vla(robot_model: RobotModel) -> dict:
             },
         },
         "video": {
-            "ego_view": {"original_key": "observation.images.ego_view"},
+            **ego_view_video,
         },
         "annotation": {
             "human.task_description": {"original_key": "task_index"},
@@ -202,20 +213,42 @@ def get_modality_config_sonic_vla(robot_model: RobotModel) -> dict:
     }
 
 
-def get_features_sonic_vla(robot_model: RobotModel) -> dict:
+def get_features_sonic_vla(robot_model: RobotModel, stereo_ego_view: bool = False) -> dict:
     """Return the dataset features for the Sonic VLA dataset.
 
     The returned dict populates the "features" key of meta/info.json.
+
+    When ``stereo_ego_view`` is set, the single monocular ``ego_view`` video is
+    replaced by a stereo pair (``ego_view_left`` + ``ego_view_right``), one
+    entry per eye.
     """
     joint_names = robot_model.joint_names
     num_joints = robot_model.num_joints
 
+    if stereo_ego_view:
+        ego_view_features = {
+            "observation.images.ego_view_left": {
+                "dtype": "video",
+                "shape": [EGO_VIEW_HEIGHT, EGO_VIEW_WIDTH, 3],
+                "names": ["height", "width", "channel"],
+            },
+            "observation.images.ego_view_right": {
+                "dtype": "video",
+                "shape": [EGO_VIEW_HEIGHT, EGO_VIEW_WIDTH, 3],
+                "names": ["height", "width", "channel"],
+            },
+        }
+    else:
+        ego_view_features = {
+            "observation.images.ego_view": {
+                "dtype": "video",
+                "shape": [EGO_VIEW_HEIGHT, EGO_VIEW_WIDTH, 3],
+                "names": ["height", "width", "channel"],
+            },
+        }
+
     return {
-        "observation.images.ego_view": {
-            "dtype": "video",
-            "shape": [EGO_VIEW_HEIGHT, EGO_VIEW_WIDTH, 3],
-            "names": ["height", "width", "channel"],
-        },
+        **ego_view_features,
         "observation.state": {
             "dtype": "float64",
             "shape": (num_joints,),
