@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import time
+from typing import Literal
 
 import msgpack
 import numpy as np
@@ -34,6 +35,7 @@ import zmq
 from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 from gear_sonic.data.exporter import Gr00tDataExporter
 from gear_sonic.data.features_sonic_vla import (
+    _tactile_devices,
     get_features_sonic_vla,
     get_g1_robot_model,
     get_modality_config_sonic_vla,
@@ -109,7 +111,12 @@ class SonicDataExporterConfig:
 
     # ZMQ: JuQiao tactile skin suit (from tactile_publisher.py)
     record_tactile: bool = False
-    """Record the 3-device JuQiao tactile suit (observation.tactile_{vest,left_arm,right_arm})."""
+    """Record the JuQiao tactile suit. Devices depend on ``tactile_mode``."""
+
+    tactile_mode: Literal["single", "triple"] = "triple"
+    """Tactile suit layout: 'triple' (清华 V1.0: vest/left_arm/right_arm) or
+    'single' (矩侨 V2.3: one 'body' device). Must match the publisher's
+    --tactile-mode."""
 
     tactile_zmq_host: str = "localhost"
     """ZMQ host for tactile publisher."""
@@ -248,6 +255,7 @@ class GrootDataCollector:
         state_zmq_host: str = "localhost",
         state_zmq_port: int = 5557,
         record_tactile: bool = False,
+        tactile_mode: str = "triple",
         tactile_zmq_host: str = "localhost",
         tactile_zmq_port: int = 5558,
         tactile_max_age_sec: float = 0.1,
@@ -268,18 +276,20 @@ class GrootDataCollector:
         self.latest_proprio_msg = None
         self.latest_sonic_msg = None
         self.latest_planner_msg = None
-        # 3-device tactile suit: keep the latest frame per device, keyed by the
+        # Tactile suit: keep the latest frame per device, keyed by the
         # publisher's per-device topic. Missing/stale devices are zero-filled
-        # independently at record time.
+        # independently at record time. The device set is mode-driven
+        # (single='body'; triple=vest/left_arm/right_arm) so this loop has no
+        # single/triple special-casing.
         self.latest_tactile_msgs: dict = {}
-        self._tactile_devices = ("vest", "left_arm", "right_arm")
+        self._tactile_devices = _tactile_devices(tactile_mode)
         self._tactile_topic_to_device = {
-            b"tactile.vest": "vest",
-            b"tactile.left_arm": "left_arm",
-            b"tactile.right_arm": "right_arm",
+            f"tactile.{device}".encode("utf-8"): device
+            for device in self._tactile_devices
         }
 
         self.record_tactile = record_tactile
+        self.tactile_mode = tactile_mode
         self.tactile_max_age_sec = tactile_max_age_sec
 
         self.current_stream_mode = 0
@@ -344,7 +354,8 @@ class GrootDataCollector:
                 time.sleep(0.2)
                 print(
                     f"[Tactile] Subscribed to {tactile_zmq_host}:{tactile_zmq_port} "
-                    "(topic prefix 'tactile' -> vest / left_arm / right_arm)"
+                    f"(mode={tactile_mode}, topic prefix 'tactile' -> "
+                    f"{' / '.join(self._tactile_devices)})"
                 )
             except Exception as e:
                 print(f"[Tactile] Warning: failed to init ZMQ subscriber: {e}")
@@ -1078,9 +1089,9 @@ def main(config: SonicDataExporterConfig):
                 modality_config[key] = value
 
     if config.record_tactile:
-        print("[Tactile] Tactile suit enabled — adding to dataset schema")
-        dataset_features.update(get_tactile_features())
-        tactile_modality = get_tactile_modality_config()
+        print(f"[Tactile] Tactile suit enabled (mode={config.tactile_mode}) — adding to schema")
+        dataset_features.update(get_tactile_features(config.tactile_mode))
+        tactile_modality = get_tactile_modality_config(config.tactile_mode)
         for key, value in tactile_modality.items():
             if key in modality_config:
                 modality_config[key].update(value)
@@ -1103,6 +1114,7 @@ def main(config: SonicDataExporterConfig):
             **robot_config,
             "record_wrist_cameras": config.record_wrist_cameras,
             "record_tactile": config.record_tactile,
+            "tactile_mode": config.tactile_mode,
             "stereo_ego_view": config.stereo_ego_view,
         },
     )
@@ -1119,6 +1131,7 @@ def main(config: SonicDataExporterConfig):
         state_zmq_host=config.state_zmq_host,
         state_zmq_port=config.state_zmq_port,
         record_tactile=config.record_tactile,
+        tactile_mode=config.tactile_mode,
         tactile_zmq_host=config.tactile_zmq_host,
         tactile_zmq_port=config.tactile_zmq_port,
         tactile_max_age_sec=config.tactile_max_age_sec,

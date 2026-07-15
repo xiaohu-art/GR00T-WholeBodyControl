@@ -101,6 +101,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="skip the tactile window (MuJoCo-only replay)",
     )
+    ap.add_argument(
+        "--tactile-key",
+        default=TACTILE_COL,
+        help=f"tactile parquet column to render (default {TACTILE_COL}; "
+        "triple-mode e.g. observation.tactile_vest)",
+    )
     return ap.parse_args()
 
 
@@ -201,15 +207,16 @@ def main() -> int:
         return 1
 
     # --- Tactile setup (optional / graceful) ---
-    has_tactile = (not args.no_tactile) and (TACTILE_COL in df.columns)
+    tactile_col = args.tactile_key
+    has_tactile = (not args.no_tactile) and (tactile_col in df.columns)
     tactile: np.ndarray | None = None
     vmax = 1
     region_max_series: np.ndarray | None = None
     if has_tactile:
-        tactile = np.stack(df[TACTILE_COL].to_numpy())
+        tactile = np.stack(df[tactile_col].to_numpy())
         if tactile.shape[1] != TACTILE_DIM:
             print(
-                f"[replay] {TACTILE_COL} dim {tactile.shape[1]} != {TACTILE_DIM}; "
+                f"[replay] {tactile_col} dim {tactile.shape[1]} != {TACTILE_DIM}; "
                 "disabling tactile window",
                 file=sys.stderr,
             )
@@ -220,7 +227,7 @@ def main() -> int:
             vmax = max(int(tactile.max()), 1)
             region_max_series = tactile.max(axis=1)
     elif not args.no_tactile:
-        print(f"[replay] no {TACTILE_COL} column; MuJoCo-only replay")
+        print(f"[replay] no {tactile_col} column; MuJoCo-only replay")
 
     rate = resolve_rate(args.parquet, args.rate)
     period = 1.0 / rate

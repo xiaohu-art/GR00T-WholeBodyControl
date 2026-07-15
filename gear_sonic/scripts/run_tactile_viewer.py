@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Live OpenCV viewer for the 3-device JuQiao tactile skin ZMQ stream.
+"""Live OpenCV viewer for the JuQiao tactile skin ZMQ stream.
 
 Subscribes to the ``tactile`` topic prefix that ``tactile_publisher.py``
 publishes (and that ``run_data_exporter.py`` records) and renders each device
-in its own window in real time:
+in its own window in real time. ``--tactile-mode`` selects the device set:
 
-    tactile.vest      -> body-region layout (reused from visualize_tactile.py)
-    tactile.left_arm  -> 16x16 grid
-    tactile.right_arm -> 16x16 grid
+    triple (default):
+        tactile.vest      -> body-region layout (reused from visualize_tactile.py)
+        tactile.left_arm  -> 16x16 grid
+        tactile.right_arm -> 16x16 grid
+    single:
+        tactile.body      -> body-region layout
 
 This viewer is read-only: a ZMQ PUB socket fans out to every SUB independently,
 so running it alongside the data exporter does not steal frames or otherwise
@@ -43,13 +46,13 @@ from visualize_tactile import (  # noqa: E402
     _render_region,
 )
 
-# Per-device topic -> device name.
-TOPIC_TO_DEVICE = {
-    b"tactile.vest": "vest",
-    b"tactile.left_arm": "left_arm",
-    b"tactile.right_arm": "right_arm",
+# Device list per collection mode (must match the publisher / exporter).
+_DEVICES_BY_MODE = {
+    "single": ("body",),
+    "triple": ("vest", "left_arm", "right_arm"),
 }
-DEVICES = ("vest", "left_arm", "right_arm")
+# Devices rendered with the body-region (vest) layout; others use the 16x16 arm grid.
+_BODY_REGION_DEVICES = ("vest", "body")
 
 # Arm sleeve raw-channel order -> 16x16 grid (spec "手臂分区1: 从左到右"):
 # channels 129..256 then 1..128, here 0-based.
@@ -59,6 +62,12 @@ ARM_CELL_PX = 22
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--tactile-mode",
+        choices=("single", "triple"),
+        default="triple",
+        help="triple=3设备(vest/left_arm/right_arm，默认)；single=单设备 body。需与 publisher 一致。",
+    )
     parser.add_argument(
         "--tactile-zmq-host",
         default="localhost",
@@ -146,7 +155,7 @@ class DeviceView:
         )
         if age > stale_sec:
             status += "  [STALE]"
-        if self.device == "vest":
+        if self.device in _BODY_REGION_DEVICES:
             canvas = _compose_frame(
                 self.last_frame, vmax, len(self.history) - 1, len(self.history), False, series
             )
@@ -163,6 +172,9 @@ def main() -> int:
     args = parse_args()
     endpoint = f"tcp://{args.tactile_zmq_host}:{args.tactile_zmq_port}"
 
+    devices = _DEVICES_BY_MODE[args.tactile_mode]
+    topic_to_device = {f"tactile.{dev}".encode("utf-8"): dev for dev in devices}
+
     ctx = zmq.Context()
     sock = ctx.socket(zmq.SUB)
     # Do NOT use ZMQ_CONFLATE: the publisher sends multi-part messages and
@@ -171,10 +183,13 @@ def main() -> int:
     sock.setsockopt(zmq.RCVHWM, 30)
     sock.setsockopt_string(zmq.SUBSCRIBE, args.topic)  # prefix -> all 3 topics
     sock.connect(endpoint)
-    print(f"[tactile-viewer] SUB connected to {endpoint} (topic prefix={args.topic!r})")
+    print(
+        f"[tactile-viewer] SUB connected to {endpoint} "
+        f"(mode={args.tactile_mode}, topic prefix={args.topic!r} -> {'/'.join(devices)})"
+    )
     print("[tactile-viewer] keys: q / ESC to quit")
 
-    views = {dev: DeviceView(dev, f"{args.window}: {dev}", args.history) for dev in DEVICES}
+    views = {dev: DeviceView(dev, f"{args.window}: {dev}", args.history) for dev in devices}
 
     try:
         while True:
@@ -186,7 +201,7 @@ def main() -> int:
                 except zmq.Again:
                     break
                 if len(parts) == 3:
-                    device = TOPIC_TO_DEVICE.get(parts[0])
+                    device = topic_to_device.get(parts[0])
                     if device is not None:
                         latest[device] = parts[2]
                         counts[device] = counts.get(device, 0) + 1

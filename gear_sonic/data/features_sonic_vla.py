@@ -428,14 +428,30 @@ def get_wrist_camera_modality_config() -> dict:
     }
 
 
-_TACTILE_DEVICES = ("vest", "left_arm", "right_arm")
+# Device list per collection mode. Kept local (not imported from JuQiao) so the
+# gear_sonic side stays standalone; it must agree with JuQiao's tactile_layout:
+#   triple -> vest / left_arm / right_arm (清华 V1.0, 3 USB)
+#   single -> body                        (矩侨 V2.3, 1 USB)
+_TACTILE_DEVICES_BY_MODE = {
+    "single": ("body",),
+    "triple": ("vest", "left_arm", "right_arm"),
+}
 
 
-def get_tactile_features() -> dict:
-    """Features for the optional 3-device JuQiao tactile suit.
+def _tactile_devices(mode: str) -> tuple[str, ...]:
+    try:
+        return _TACTILE_DEVICES_BY_MODE[mode]
+    except KeyError:
+        raise ValueError(
+            f"unknown tactile mode {mode!r}; expected one of {tuple(_TACTILE_DEVICES_BY_MODE)}"
+        )
 
-    Added when ``record_tactile`` is set: one 256-channel raw array per device
-    (short-sleeve vest + left/right arm sleeves).
+
+def get_tactile_features(mode: str = "triple") -> dict:
+    """Features for the optional JuQiao tactile suit.
+
+    Added when ``record_tactile`` is set: one 256-channel raw array per device.
+    ``triple`` = vest + left/right arm sleeves; ``single`` = one ``body`` skin.
     """
     names = [f"raw_{i:03d}" for i in range(1, 257)]
     return {
@@ -444,16 +460,16 @@ def get_tactile_features() -> dict:
             "shape": (256,),
             "names": list(names),
         }
-        for device in _TACTILE_DEVICES
+        for device in _tactile_devices(mode)
     }
 
 
-def get_tactile_modality_config() -> dict:
-    """Modality config entries for the optional 3-device tactile suit."""
+def get_tactile_modality_config(mode: str = "triple") -> dict:
+    """Modality config entries for the optional tactile suit."""
     return {
         "tactile": {
             device: {"original_key": f"observation.tactile_{device}"}
-            for device in _TACTILE_DEVICES
+            for device in _tactile_devices(mode)
         },
     }
 

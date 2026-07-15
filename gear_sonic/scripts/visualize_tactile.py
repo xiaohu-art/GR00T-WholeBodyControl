@@ -1,5 +1,7 @@
-"""Interactive OpenCV playback of the ``observation.tactile_raw`` column from
-a LeRobot-format parquet episode.
+"""Interactive OpenCV playback of a tactile column from a LeRobot-format
+parquet episode. Which column is chosen via ``--tactile-key`` (default
+``observation.tactile_body``; for a triple-mode dataset pass e.g.
+``observation.tactile_vest``).
 
 Layout (one canvas per frame):
     ┌─────────────────────────────────────────────────┐
@@ -39,7 +41,9 @@ if str(REPO_ROOT / "JuQiao") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "JuQiao"))
 from jq_tactile_skin.mappings import REGIONS  # noqa: E402
 
-TACTILE_COL = "observation.tactile_raw"
+# Default tactile column. Single-mode datasets record ``observation.tactile_body``;
+# triple-mode records one column per device (pass --tactile-key to pick one).
+TACTILE_COL = "observation.tactile_body"
 TACTILE_DIM = 256
 
 # Per-region cell size (px) — bigger for chest/back, smaller for limbs.
@@ -57,9 +61,9 @@ LABEL_H = 22
 CANVAS_BG = (24, 24, 24)
 
 
-def _load_tactile(parquet_path: Path) -> np.ndarray:
-    df = pd.read_parquet(parquet_path, columns=[TACTILE_COL])
-    arr = np.stack(df[TACTILE_COL].to_numpy())
+def _load_tactile(parquet_path: Path, col: str = TACTILE_COL) -> np.ndarray:
+    df = pd.read_parquet(parquet_path, columns=[col])
+    arr = np.stack(df[col].to_numpy())
     if arr.shape[1] != TACTILE_DIM:
         raise ValueError(f"Expected last dim {TACTILE_DIM}, got {arr.shape}")
     return arr.astype(np.uint8, copy=False)
@@ -182,8 +186,8 @@ def _compose_frame(
     return canvas
 
 
-def play(parquet_path: Path, fps: float, window: str) -> None:
-    tactile = _load_tactile(parquet_path)
+def play(parquet_path: Path, fps: float, window: str, col: str = TACTILE_COL) -> None:
+    tactile = _load_tactile(parquet_path, col)
     n_frames = tactile.shape[0]
     vmax = max(int(tactile.max()), 1)
     region_max_series = tactile.max(axis=1)
@@ -271,10 +275,16 @@ def main() -> int:
         default="tactile",
         help="OpenCV window title.",
     )
+    parser.add_argument(
+        "--tactile-key",
+        default=TACTILE_COL,
+        help=f"Parquet column to visualize (default {TACTILE_COL}; "
+        "triple-mode e.g. observation.tactile_vest).",
+    )
     args = parser.parse_args()
     if not args.parquet.is_file():
         parser.error(f"Not a file: {args.parquet}")
-    play(args.parquet, args.fps, args.window)
+    play(args.parquet, args.fps, args.window, args.tactile_key)
     return 0
 
 

@@ -37,6 +37,41 @@ def topic_for_device(device: str, prefix: str = TOPIC_PREFIX) -> str:
     return f"{prefix}.{device}"
 
 
+# ---------------------------------------------------------------------------
+# Collection layout: single- vs three-device suits share ONE mechanism.
+#
+# A "layout" is just the list of tactile devices to record. The 3-device 清华
+# V1.0 suit (``triple``) has vest + left_arm + right_arm, each self-identifying
+# via a sensor-type byte. The single 矩侨 V2.3 skin garment (``single``) is one
+# device named ``body`` that does NOT need identity routing (``sensor_type`` is
+# None -> the publisher accepts whatever the one port streams and skips the
+# per-device / set validation). Every downstream tool (publisher, exporter,
+# viewer) iterates this list, so there is no single/triple special-casing.
+# ---------------------------------------------------------------------------
+
+TACTILE_MODES = ("single", "triple")
+
+
+@dataclass(frozen=True)
+class TactileDeviceSpec:
+    name: str  # device id, also the modality/feature suffix, e.g. "vest" / "body"
+    topic: str  # ZMQ topic, always ``tactile.<name>``
+    sensor_type: int | None  # expected sensor byte for routing; None -> accept any
+
+
+def tactile_layout(mode: str) -> list[TactileDeviceSpec]:
+    """Return the ordered device list for a collection ``mode``."""
+    if mode == "triple":
+        return [
+            TactileDeviceSpec("vest", topic_for_device("vest"), 0x05),
+            TactileDeviceSpec("left_arm", topic_for_device("left_arm"), 0x01),
+            TactileDeviceSpec("right_arm", topic_for_device("right_arm"), 0x02),
+        ]
+    if mode == "single":
+        return [TactileDeviceSpec("body", topic_for_device("body"), None)]
+    raise ValueError(f"未知 tactile mode {mode!r}；可选 {TACTILE_MODES}")
+
+
 @dataclass(frozen=True)
 class Packet:
     order: int

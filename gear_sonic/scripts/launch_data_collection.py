@@ -34,6 +34,7 @@ Usage (from repo root — no venv activation needed):
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 import os
 import shutil
 import signal
@@ -147,7 +148,13 @@ class DataCollectionLaunchConfig:
     # PUB on tcp://<host>:<port>. The launcher only configures the subscriber
     # side of the data exporter.
     record_tactile: bool = False
-    """Subscribe to the JuQiao tactile publisher and record the 3 devices (vest/left_arm/right_arm)."""
+    """Subscribe to the JuQiao tactile publisher and record the suit
+    (devices depend on --tactile-mode)."""
+
+    tactile_mode: Literal["single", "triple"] = "triple"
+    """Tactile layout: 'triple' (清华 V1.0: vest/left_arm/right_arm, default) or
+    'single' (矩侨 V2.3: one 'body' device). MUST match the tactile_publisher's
+    --tactile-mode, or devices will be zero-filled."""
 
     tactile_zmq_host: str = "localhost"
     """ZMQ host the tactile publisher is bound to (e.g. the G1's IP)."""
@@ -310,7 +317,7 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Wrist cameras:   {'Yes' if config.record_wrist_cameras else 'No'}")
     if config.record_tactile:
         print(
-            f"  Tactile suit:    Yes (subscribing "
+            f"  Tactile suit:    Yes [{config.tactile_mode}] (subscribing "
             f"tcp://{config.tactile_zmq_host}:{config.tactile_zmq_port})"
         )
     else:
@@ -422,6 +429,7 @@ def main(config: DataCollectionLaunchConfig):
     if config.record_tactile:
         exporter_cmd += (
             f" --record-tactile"
+            f" --tactile-mode {config.tactile_mode}"
             f" --tactile-zmq-host {config.tactile_zmq_host}"
             f" --tactile-zmq-port {config.tactile_zmq_port}"
         )
@@ -447,11 +455,16 @@ def main(config: DataCollectionLaunchConfig):
         print("    MuJoCo Simulator (.venv_sim)")
         print()
     if config.record_tactile:
+        _devices = "body" if config.tactile_mode == "single" else "vest/left_arm/right_arm"
         print(
             f"  Tactile subscriber: tcp://{config.tactile_zmq_host}:"
-            f"{config.tactile_zmq_port} (topic prefix 'tactile' -> vest/left_arm/right_arm)"
+            f"{config.tactile_zmq_port} (mode={config.tactile_mode}, "
+            f"topic prefix 'tactile' -> {_devices})"
         )
-        print("    Publisher is expected to run separately (e.g. on the G1).")
+        print(
+            f"    Publisher must run separately with --tactile-mode {config.tactile_mode} "
+            "(e.g. on the G1)."
+        )
         print()
     print("  Window 'data_collection':")
     print("    Pane 0 (top-left):     C++ Deploy")

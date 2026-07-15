@@ -38,6 +38,12 @@ Threading model: one worker thread per serial port reads + calibrates +
 enqueues (topic, header, payload) tuples; the main thread is the *only* thread
 that touches the ZMQ socket (libzmq sockets are not thread-safe), draining the
 queue and sending.
+
+Mode switch (``--tactile-mode``): the above describes ``triple`` (default, the
+3-device 清华 V1.0 suit). ``single`` supports the older 矩侨 V2.3 single skin
+garment — exactly one port, no sensor-type routing/validation, published as one
+device ``body`` on topic ``tactile.body``. Both share the same code path via
+``tactile_layout()``.
 """
 
 from __future__ import annotations
@@ -58,8 +64,11 @@ if str(ROOT) not in sys.path:
 from jq_tactile_skin.protocol import (  # noqa: E402
     DEVICE_BY_SENSOR_TYPE,
     EXPECTED_DEVICES,
+    TACTILE_MODES,
     FrameParser,
     SampleAssembler,
+    TactileDeviceSpec,
+    tactile_layout,
     topic_for_device,
 )
 
@@ -86,10 +95,17 @@ def iter_samples(ser: Any, parser: FrameParser, assembler: SampleAssembler, stop
 
 
 class Worker:
-    """State for one serial port: its thread, detected device, and status."""
+    """State for one serial port: its thread, detected device, and status.
 
-    def __init__(self, port: str) -> None:
+    ``spec`` is set in single-device mode: the device identity is fixed up
+    front (no sensor-type probing), so the worker skips detection/validation
+    and accepts whatever the one port streams. In triple mode ``spec`` is None
+    and the device is discovered from its sensor-type byte.
+    """
+
+    def __init__(self, port: str, spec: TactileDeviceSpec | None = None) -> None:
         self.port = port
+        self.spec = spec
         self.device: str | None = None
         self.probed = threading.Event()  # set once the device type is known
         self.ready = threading.Event()  # set once calibration is done
@@ -113,28 +129,39 @@ def _worker_main(
             assembler = SampleAssembler()
             samples = iter_samples(ser, parser, assembler, stop)
 
-            # Detect device from the first frame's sensor type and, in the same
-            # pass, accumulate the zero-point baseline over calibration frames.
+            # Fixed identity (single-device mode): the device is known up front,
+            # so we set it immediately and accept any sensor type. Otherwise
+            # (triple mode) discover it from the first frame's sensor byte.
+            fixed = w.spec is not None
+            if fixed:
+                device = w.spec.name
+                w.device = device
+                w.probed.set()
+                print(f"[tactile-pub] {w.port} -> {device} (single, 不校验类型)", file=sys.stderr)
+
+            # Accumulate the zero-point baseline over calibration frames, and in
+            # triple mode identify/validate the device in the same pass.
             sums = [0.0] * RAW_LEN
-            device: str | None = None
+            device = w.spec.name if fixed else None
             collected = 0
             for sample in samples:
                 if stop.is_set():
                     return
-                dev = DEVICE_BY_SENSOR_TYPE.get(sample.sensor_type)
-                if dev is None:
-                    raise RuntimeError(
-                        f"{w.port}: 未知传感器类型 0x{sample.sensor_type:02X}"
-                    )
-                if device is None:
-                    device = dev
-                    w.device = dev
-                    w.probed.set()
-                    print(f"[tactile-pub] {w.port} -> {device}", file=sys.stderr)
-                elif dev != device:
-                    raise RuntimeError(
-                        f"{w.port}: 同一串口出现多种传感器类型（{device} 与 {dev}）"
-                    )
+                if not fixed:
+                    dev = DEVICE_BY_SENSOR_TYPE.get(sample.sensor_type)
+                    if dev is None:
+                        raise RuntimeError(
+                            f"{w.port}: 未知传感器类型 0x{sample.sensor_type:02X}"
+                        )
+                    if device is None:
+                        device = dev
+                        w.device = dev
+                        w.probed.set()
+                        print(f"[tactile-pub] {w.port} -> {device}", file=sys.stderr)
+                    elif dev != device:
+                        raise RuntimeError(
+                            f"{w.port}: 同一串口出现多种传感器类型（{device} 与 {dev}）"
+                        )
                 for i, value in enumerate(sample.raw):
                     sums[i] += value
                 collected += 1
@@ -145,7 +172,8 @@ def _worker_main(
                 raise RuntimeError(f"{w.port}: 未收到任何数据帧")
 
             baseline = [s / collected for s in sums]
-            topic_bytes = topic_for_device(device).encode("utf-8")
+            topic = w.spec.topic if fixed else topic_for_device(device)
+            topic_bytes = topic.encode("utf-8")
             print(
                 f"[tactile-pub] {device} 校准完成（{collected} 帧），开始发布",
                 file=sys.stderr,
@@ -220,10 +248,17 @@ def parse_args() -> argparse.Namespace:
         description="ZMQ publisher for the 3-device JuQiao tactile skin suit"
     )
     parser.add_argument(
+        "--tactile-mode",
+        choices=TACTILE_MODES,
+        default="triple",
+        help="triple=3设备清华皮肤衣(vest/left_arm/right_arm，默认)；"
+        "single=旧矩侨单皮肤衣(1个设备 body)",
+    )
+    parser.add_argument(
         "--ports",
         required=True,
-        help="逗号分隔的三个串口设备（顺序无所谓），例如 "
-        "/dev/ttyACM0,/dev/ttyACM1,/dev/ttyACM2",
+        help="逗号分隔的串口设备(顺序无所谓)：triple 需 3 个(如 "
+        "/dev/ttyACM0,/dev/ttyACM1,/dev/ttyACM2)，single 需 1 个",
     )
     parser.add_argument("--baud", type=int, default=921600, help="波特率，默认 921600")
     parser.add_argument("--zmq-host", default="0.0.0.0", help="ZMQ 绑定地址，默认 0.0.0.0")
@@ -272,10 +307,12 @@ def main() -> int:
     args = parse_args()
 
     ports = [p.strip() for p in args.ports.split(",") if p.strip()]
-    expected_n = len(EXPECTED_DEVICES)
+    layout = tactile_layout(args.tactile_mode)
+    expected_n = len(layout)
     if len(ports) != expected_n:
         raise SystemExit(
-            f"--ports 需要恰好 {expected_n} 个串口（短袖/左臂/右臂），当前收到 {len(ports)} 个：{ports}"
+            f"--tactile-mode {args.tactile_mode} 需要恰好 {expected_n} 个串口，"
+            f"当前收到 {len(ports)} 个：{ports}"
         )
 
     try:
@@ -331,7 +368,11 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _sigint)
 
     out_queue: "queue.Queue" = queue.Queue(maxsize=1000)
-    workers = [Worker(p) for p in ports]
+    if args.tactile_mode == "single":
+        # One fixed device: no sensor-type routing, so pin the spec up front.
+        workers = [Worker(ports[0], spec=layout[0])]
+    else:
+        workers = [Worker(p) for p in ports]
     for w in workers:
         w.thread = threading.Thread(
             target=_worker_main,
@@ -359,16 +400,18 @@ def main() -> int:
 
         _raise_worker_errors(workers)
 
-        # Phase 2: validate the detected set is exactly the expected devices.
-        detected = [w.device for w in workers]
-        if sorted(detected) != sorted(EXPECTED_DEVICES):
-            missing = sorted(EXPECTED_DEVICES - set(detected))
-            dupes = sorted({d for d in detected if detected.count(d) > 1})
-            raise SystemExit(
-                "设备身份校验失败："
-                f"检测到 {detected}；缺失 {missing or '无'}；重复 {dupes or '无'}。"
-                "请确认短袖(0x05)、左臂(0x01)、右臂(0x02)三台设备均已连接。"
-            )
+        # Phase 2: (triple only) validate the detected set is exactly the
+        # expected devices. Single mode has one fixed device, nothing to check.
+        if args.tactile_mode == "triple":
+            detected = [w.device for w in workers]
+            if sorted(detected) != sorted(EXPECTED_DEVICES):
+                missing = sorted(EXPECTED_DEVICES - set(detected))
+                dupes = sorted({d for d in detected if detected.count(d) > 1})
+                raise SystemExit(
+                    "设备身份校验失败："
+                    f"检测到 {detected}；缺失 {missing or '无'}；重复 {dupes or '无'}。"
+                    "请确认短袖(0x05)、左臂(0x01)、右臂(0x02)三台设备均已连接。"
+                )
 
         # Phase 3: wait for all per-device calibrations to finish.
         while not all(w.ready.is_set() for w in workers):
@@ -377,7 +420,10 @@ def main() -> int:
             time.sleep(0.05)
         _raise_worker_errors(workers)
 
-        print("[tactile-pub] 三台设备均已就绪，开始发布...", file=sys.stderr)
+        print(
+            f"[tactile-pub] {len(workers)} 台设备({args.tactile_mode})均已就绪，开始发布...",
+            file=sys.stderr,
+        )
         time.sleep(args.warmup_sec)
 
         # Phase 4: drain the queue and publish (single-threaded socket access).
@@ -398,7 +444,7 @@ def main() -> int:
                     for w in workers:
                         w.recalibrate.set()
                     print(
-                        "[tactile-pub] 收到重新校准信号，三台设备将重新采集零点基线",
+                        f"[tactile-pub] 收到重新校准信号，{len(workers)} 台设备将重新采集零点基线",
                         file=sys.stderr,
                     )
 
