@@ -6,7 +6,8 @@ All communication uses ZMQ:
   1. Robot state  -> ZMQ SUB on ``g1_debug`` topic (from C++ zmq_output_handler)
   2. Actions out  -> ZMQ PUB (latent protocol v4: motion token + hand joints)
   3. Camera       -> ZMQ/TCP via ComposedCameraClientSensor
-  4. Keyboard     -> ZMQ SUB via ZMQKeyboardSubscriber
+  4. Tactile      -> ZMQ SUB on one exact ``tactile.<device>`` topic
+  5. Keyboard     -> ZMQ SUB via ZMQKeyboardSubscriber
 
 Uses the Isaac-GR00T PolicyClient (ZMQ REQ/REP) to communicate with a
 running PolicyServer.
@@ -46,6 +47,7 @@ from gear_sonic.utils.inference.dataset_initial_poses import (
     load_dataset_initial_poses,
 )
 from gear_sonic.utils.inference.initial_poses import LATENT_INITIAL_MOTION_TOKEN
+from gear_sonic.utils.inference.tactile_subscriber import ZMQTactileSubscriber
 from gear_sonic.utils.inference.vla_utils import (
     calculate_latency_compensated_index,
     concat_action,
@@ -111,12 +113,29 @@ class InferenceConfig:
     """ZMQ port for keyboard input."""
 
     # Camera modality
-    stereo_ego_view: bool = False
+    stereo_ego_view: bool = True
     """Feed the ego view to the policy as a stereo pair (``ego_view_left`` +
     ``ego_view_right``) instead of a single monocular ``ego_view``. Must match
     the modality the policy was trained with. Requires the camera server to be
     started with ``--ego-view-camera usb_stereo`` (which publishes both
     ``ego_view_left`` and ``ego_view_right`` image keys)."""
+
+    # Tactile modality
+    use_tactile: bool = True
+    """Require a fresh uint8[256] tactile frame for every policy request."""
+
+    tactile_zmq_host: str = "localhost"
+    """Host running the JuQiao tactile publisher."""
+
+    tactile_zmq_port: int = 5558
+    """Port of the JuQiao tactile publisher."""
+
+    tactile_device: str = "body"
+    """Exact tactile device/topic used by the checkpoint. The carry-bucket
+    checkpoint uses the legacy single-device ``tactile.body`` layout."""
+
+    tactile_max_age_sec: float = 0.1
+    """Maximum local receive age for a tactile frame used in inference."""
 
     # Embodiment
     embodiment_tag: str = "unitree_g1_sonic"
@@ -235,7 +254,9 @@ def prepare_observation_from_sensors(
     robot_model,
     language_prompt: str,
     log_errors: bool = False,
-    stereo_ego_view: bool = False,
+    stereo_ego_view: bool = True,
+    tactile_subscriber=None,
+    tactile_max_age_sec: float = 0.1,
 ):
     """Read sensors and prepare observation for the VLA policy.
 
@@ -253,6 +274,17 @@ def prepare_observation_from_sensors(
         if log_errors:
             print("[DEBUG] prepare_observation: waiting for state msg..", flush=True)
         return None
+
+    tactile_frame = None
+    if tactile_subscriber is not None:
+        tactile_frame = tactile_subscriber.read_fresh(tactile_max_age_sec)
+        if tactile_frame is None:
+            if log_errors:
+                print(
+                    f"[DEBUG] prepare_observation: {tactile_subscriber.last_error}",
+                    flush=True,
+                )
+            return None
 
     # Copy index finger data to middle finger (hardware coupling)
     state_msg["left_hand_q"][5] = state_msg["left_hand_q"][3]
@@ -300,6 +332,11 @@ def prepare_observation_from_sensors(
     }
 
     observation = prepare_observation_for_eval(robot_model, observation)
+
+    if tactile_frame is not None:
+        observation["tactile"] = {
+            "tactile_raw": tactile_frame.raw[np.newaxis, np.newaxis],
+        }
 
     # Projected gravity for Sonic latent embodiment
     assert "base_quat" in state_msg, "base_quat not found in state_msg"
@@ -424,6 +461,19 @@ def main(config: InferenceConfig):
     camera_subscriber = ComposedCameraClientSensor(
         server_ip=config.camera_host, port=config.camera_port
     )
+
+    tactile_subscriber = None
+    if config.use_tactile:
+        tactile_subscriber = ZMQTactileSubscriber(
+            host=config.tactile_zmq_host,
+            port=config.tactile_zmq_port,
+            device=config.tactile_device,
+        )
+        print_green(
+            f"Subscribed to tactile.{config.tactile_device} at "
+            f"tcp://{config.tactile_zmq_host}:{config.tactile_zmq_port} "
+            f"(max age {config.tactile_max_age_sec:.3f}s)"
+        )
 
     zmq_context = zmq.Context()
     zmq_socket = zmq_context.socket(zmq.PUB)
@@ -707,6 +757,8 @@ def main(config: InferenceConfig):
                 language_prompt=language_prompt_ref[0],
                 log_errors=True,
                 stereo_ego_view=config.stereo_ego_view,
+                tactile_subscriber=tactile_subscriber,
+                tactile_max_age_sec=config.tactile_max_age_sec,
             ),
             lambda obs: run_policy_inference_and_process(
                 policy=n1_policy,
@@ -843,6 +895,8 @@ def main(config: InferenceConfig):
         inference_worker_thread.join(timeout=1.0)
         zmq_socket.close()
         zmq_context.term()
+        if tactile_subscriber is not None:
+            tactile_subscriber.close()
         state_subscriber.close()
         keyboard_listener.close()
         print("Shutdown complete.")

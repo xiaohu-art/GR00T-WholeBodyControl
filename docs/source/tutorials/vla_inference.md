@@ -8,7 +8,7 @@ using the Sonic whole-body control stack.
 The inference pipeline consists of:
 
 1. **Isaac-GR00T PolicyServer** — loads the VLA model and serves actions over ZMQ
-2. **VLA inference client** (`run_vla_inference.py`) — reads camera + robot state,
+2. **VLA inference client** (`run_vla_inference.py`) — reads stereo camera, robot state, and tactile,
    queries the PolicyServer, and publishes actions to the C++ control loop
 3. **C++ deploy** (`gear_sonic_deploy`) — executes whole-body control on the robot
 4. **Camera server** — provides camera images over ZMQ (runs as a systemd service)
@@ -87,7 +87,8 @@ The easiest way to run inference is with the all-in-one tmux launcher:
 # Real robot
 python gear_sonic/scripts/launch_inference.py \
     --prompt "pick up the apple" \
-    --camera-host 192.168.123.164
+    --camera-host 192.168.123.164 \
+    --tactile-zmq-host 192.168.123.164
 
 # Simulation
 python gear_sonic/scripts/launch_inference.py --sim \
@@ -170,7 +171,8 @@ python gear_sonic/scripts/run_vla_inference.py \
     --port 5550 \
     --embodiment-tag unitree_g1_sonic \
     --prompt "pick up the apple" \
-    --camera-host 192.168.123.164
+    --camera-host 192.168.123.164 \
+    --tactile-zmq-host 192.168.123.164
 ```
 
 ### Terminal 4 — Data Exporter (optional)
@@ -197,6 +199,12 @@ python gear_sonic/scripts/run_data_exporter.py \
 | `--rate` | `2.5` | Inference rate (Hz) |
 | `--camera-host` | `localhost` | Camera server host |
 | `--camera-port` | `5555` | Camera server port |
+| `--stereo-ego-view` | `true` | Require `ego_view_left` and `ego_view_right` |
+| `--use-tactile` | `true` | Require a fresh tactile frame |
+| `--tactile-zmq-host` | `localhost` | JuQiao tactile publisher host |
+| `--tactile-zmq-port` | `5558` | JuQiao tactile publisher port |
+| `--tactile-device` | `body` | Exact checkpoint tactile device/topic |
+| `--tactile-max-age-sec` | `0.1` | Maximum admitted local frame age |
 | `--verbose-timing` | `false` | Always print loop timing |
 
 ### tmux Launcher (`launch_inference.py`)

@@ -111,8 +111,13 @@ uv run python gr00t/eval/run_gr00t_server.py \
 python gear_sonic/scripts/launch_inference.py \
       --prompt "put hand on the orange bottlecan" \
       --camera-host 192.168.123.164 \
+      --tactile-zmq-host 192.168.123.164 \
       --dataset-path /data/humanoid-vla/GR00T-WholeBodyControl/outputs/put_hand_on_different_objects
 ```
+
+该推理链路默认要求双目和 `tactile.body`。训练 `carry-bucket-stereo` 所用的是单个
+256 维 body 包，不能把 triple 模式的三个设备静默拼成 768 维。触觉缺失、过期或
+shape 不匹配时会跳过本次 VLA 推理，不会补零。
 
 # 可视化
 

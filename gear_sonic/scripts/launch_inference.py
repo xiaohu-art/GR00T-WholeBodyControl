@@ -145,12 +145,27 @@ class InferenceLaunchConfig:
     camera_port: int = 5555
     """Camera server port."""
 
-    stereo_ego_view: bool = False
+    stereo_ego_view: bool = True
     """Feed the ego view to the policy as a stereo pair (``ego_view_left`` +
     ``ego_view_right``) instead of a single monocular ``ego_view``. Must match
     the modality the policy was trained with. Passed through to both the VLA
     inference and the data exporter. Requires the (separately started) camera
     server to be running with ``--ego-view-camera usb_stereo``."""
+
+    use_tactile: bool = True
+    """Require the live tactile observation expected by the SONIC JEPA checkpoint."""
+
+    tactile_zmq_host: str = "localhost"
+    """JuQiao tactile publisher host."""
+
+    tactile_zmq_port: int = 5558
+    """JuQiao tactile publisher port."""
+
+    tactile_device: str = "body"
+    """Checkpoint tactile layout/topic. ``body`` matches carry-bucket-stereo."""
+
+    tactile_max_age_sec: float = 0.1
+    """Maximum age of tactile data admitted to policy inference."""
 
     # Data exporter (optional recording during inference)
     data_exporter: bool = True
@@ -282,6 +297,13 @@ def main(config: InferenceLaunchConfig):
     print(f"  Action rate:     {config.action_publish_rate} Hz")
     print(f"  Action horizon:  {config.action_horizon}")
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
+    print(f"  Stereo:          {'Required' if config.stereo_ego_view else 'Disabled'}")
+    print(
+        f"  Tactile:         tactile.{config.tactile_device} at "
+        f"{config.tactile_zmq_host}:{config.tactile_zmq_port}"
+        if config.use_tactile
+        else "  Tactile:         Disabled"
+    )
     if config.dataset_path:
         print(f"  Init pose data:  {config.dataset_path}")
     print(f"  Data exporter:   {'Yes' if config.data_exporter else 'No'}")
@@ -405,8 +427,17 @@ def main(config: InferenceLaunchConfig):
     )
     if config.dataset_path:
         inference_cmd += f" --dataset-path '{config.dataset_path}'"
-    if config.stereo_ego_view:
-        inference_cmd += " --stereo-ego-view"
+    if not config.stereo_ego_view:
+        inference_cmd += " --no-stereo-ego-view"
+    if config.use_tactile:
+        inference_cmd += (
+            f" --tactile-zmq-host {config.tactile_zmq_host}"
+            f" --tactile-zmq-port {config.tactile_zmq_port}"
+            f" --tactile-device {config.tactile_device}"
+            f" --tactile-max-age-sec {config.tactile_max_age_sec}"
+        )
+    else:
+        inference_cmd += " --no-use-tactile"
 
     print("Starting VLA inference (pane 1)...")
     _send_to_pane(2, inference_cmd, wait=1.0)
