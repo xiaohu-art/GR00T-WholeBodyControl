@@ -120,6 +120,9 @@ class InferenceLaunchConfig:
     policy_port: int = 5550
     """Isaac-GR00T PolicyServer port."""
 
+    policy_timeout_ms: int = 60_000
+    """Timeout for one policy request, including a slow first inference."""
+
     embodiment_tag: str = "unitree_g1_sonic"
     """Embodiment tag for policy inference."""
 
@@ -145,12 +148,24 @@ class InferenceLaunchConfig:
     camera_port: int = 5555
     """Camera server port."""
 
-    stereo_ego_view: bool = False
+    stereo_ego_view: bool = True
     """Feed the ego view to the policy as a stereo pair (``ego_view_left`` +
     ``ego_view_right``) instead of a single monocular ``ego_view``. Must match
     the modality the policy was trained with. Passed through to both the VLA
     inference and the data exporter. Requires the (separately started) camera
     server to be running with ``--ego-view-camera usb_stereo``."""
+
+    use_tactile: bool = True
+    """Require and forward the three-device tactile stream for HTD/JEPA checkpoints."""
+
+    tactile_zmq_host: str = "localhost"
+    """Host for the JuQiao tactile publisher."""
+
+    tactile_zmq_port: int = 5558
+    """Port for the JuQiao tactile publisher."""
+
+    tactile_max_age_sec: float = 0.1
+    """Maximum accepted age for each tactile device frame."""
 
     # Data exporter (optional recording during inference)
     data_exporter: bool = True
@@ -282,6 +297,10 @@ def main(config: InferenceLaunchConfig):
     print(f"  Action rate:     {config.action_publish_rate} Hz")
     print(f"  Action horizon:  {config.action_horizon}")
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
+    print(f"  Stereo:          {'Yes' if config.stereo_ego_view else 'No'}")
+    print(f"  Tactile:         {'Yes' if config.use_tactile else 'No'}")
+    if config.use_tactile:
+        print(f"    Tactile ZMQ:   {config.tactile_zmq_host}:{config.tactile_zmq_port}")
     if config.dataset_path:
         print(f"  Init pose data:  {config.dataset_path}")
     print(f"  Data exporter:   {'Yes' if config.data_exporter else 'No'}")
@@ -385,6 +404,13 @@ def main(config: InferenceLaunchConfig):
             exporter_cmd += f" --dataset-name '{config.dataset_name}'"
         if config.stereo_ego_view:
             exporter_cmd += " --stereo-ego-view"
+        if config.use_tactile:
+            exporter_cmd += (
+                " --record-tactile --tactile-mode triple"
+                f" --tactile-zmq-host {config.tactile_zmq_host}"
+                f" --tactile-zmq-port {config.tactile_zmq_port}"
+                f" --tactile-max-age-sec {config.tactile_max_age_sec}"
+            )
 
         print("Starting data exporter (pane 3)...")
         _send_to_pane(3, exporter_cmd, wait=2.0)
@@ -396,17 +422,27 @@ def main(config: InferenceLaunchConfig):
         f"python gear_sonic/scripts/run_vla_inference.py "
         f"--host {config.policy_host} "
         f"--port {config.policy_port} "
+        f"--policy-timeout-ms {config.policy_timeout_ms} "
         f"--embodiment-tag {config.embodiment_tag} "
         f"--prompt '{config.prompt}' "
         f"--action-publish-rate {config.action_publish_rate} "
         f"--action-horizon {config.action_horizon} "
         f"--camera-host {config.camera_host} "
-        f"--camera-port {config.camera_port}"
+        f"--camera-port {config.camera_port} "
+        f"--tactile-zmq-host {config.tactile_zmq_host} "
+        f"--tactile-zmq-port {config.tactile_zmq_port} "
+        f"--tactile-max-age-sec {config.tactile_max_age_sec}"
     )
     if config.dataset_path:
         inference_cmd += f" --dataset-path '{config.dataset_path}'"
     if config.stereo_ego_view:
         inference_cmd += " --stereo-ego-view"
+    else:
+        inference_cmd += " --no-stereo-ego-view"
+    if config.use_tactile:
+        inference_cmd += " --use-tactile"
+    else:
+        inference_cmd += " --no-use-tactile"
 
     print("Starting VLA inference (pane 1)...")
     _send_to_pane(2, inference_cmd, wait=1.0)

@@ -46,6 +46,7 @@ from gear_sonic.utils.inference.dataset_initial_poses import (
     load_dataset_initial_poses,
 )
 from gear_sonic.utils.inference.initial_poses import LATENT_INITIAL_MOTION_TOKEN
+from gear_sonic.utils.inference.tactile_subscriber import TactileSubscriber
 from gear_sonic.utils.inference.vla_utils import (
     calculate_latency_compensated_index,
     concat_action,
@@ -71,6 +72,9 @@ class InferenceConfig:
 
     port: int = 5550
     """The port of the Isaac-GR00T PolicyServer."""
+
+    policy_timeout_ms: int = 60_000
+    """Timeout for one policy request, including a slow first inference."""
 
     # Control
     action_publish_rate: int = 50
@@ -111,12 +115,24 @@ class InferenceConfig:
     """ZMQ port for keyboard input."""
 
     # Camera modality
-    stereo_ego_view: bool = False
+    stereo_ego_view: bool = True
     """Feed the ego view to the policy as a stereo pair (``ego_view_left`` +
     ``ego_view_right``) instead of a single monocular ``ego_view``. Must match
     the modality the policy was trained with. Requires the camera server to be
     started with ``--ego-view-camera usb_stereo`` (which publishes both
     ``ego_view_left`` and ``ego_view_right`` image keys)."""
+
+    use_tactile: bool = True
+    """Require and forward current vest/left-arm/right-arm tactile frames."""
+
+    tactile_zmq_host: str = "localhost"
+    """Host for the JuQiao tactile publisher."""
+
+    tactile_zmq_port: int = 5558
+    """Port for the JuQiao tactile publisher."""
+
+    tactile_max_age_sec: float = 0.1
+    """Maximum accepted age for each tactile device frame."""
 
     # Embodiment
     embodiment_tag: str = "unitree_g1_sonic"
@@ -235,7 +251,9 @@ def prepare_observation_from_sensors(
     robot_model,
     language_prompt: str,
     log_errors: bool = False,
-    stereo_ego_view: bool = False,
+    stereo_ego_view: bool = True,
+    tactile_subscriber=None,
+    use_tactile: bool = True,
 ):
     """Read sensors and prepare observation for the VLA policy.
 
@@ -253,6 +271,19 @@ def prepare_observation_from_sensors(
         if log_errors:
             print("[DEBUG] prepare_observation: waiting for state msg..", flush=True)
         return None
+
+    tactile = None
+    if use_tactile:
+        if tactile_subscriber is None:
+            raise ValueError("use_tactile=True requires a tactile_subscriber")
+        tactile = tactile_subscriber.read()
+        if tactile is None:
+            if log_errors:
+                print(
+                    f"[DEBUG] prepare_observation: {tactile_subscriber.status()}",
+                    flush=True,
+                )
+            return None
 
     # Copy index finger data to middle finger (hardware coupling)
     state_msg["left_hand_q"][5] = state_msg["left_hand_q"][3]
@@ -298,6 +329,11 @@ def prepare_observation_from_sensors(
         "q": np.asarray(qpos, dtype=np.float32)[np.newaxis, np.newaxis],
         "timestamps": ego_timestamp,
     }
+    if tactile is not None:
+        observation["tactile"] = {
+            key: np.asarray(value, dtype=np.uint8)[np.newaxis, np.newaxis]
+            for key, value in tactile.items()
+        }
 
     observation = prepare_observation_for_eval(robot_model, observation)
 
@@ -408,13 +444,34 @@ def main(config: InferenceConfig):
     # Isaac-GR00T PolicyClient
     from gr00t.policy.server_client import PolicyClient
 
-    n1_policy = PolicyClient(host=config.host, port=config.port)
+    n1_policy = PolicyClient(
+        host=config.host,
+        port=config.port,
+        timeout_ms=config.policy_timeout_ms,
+    )
 
     print(f"Connecting to PolicyServer at {config.host}:{config.port}...")
     if n1_policy.ping():
         print_green("PolicyServer is reachable.")
     else:
         print("WARNING: PolicyServer not reachable. Inference will fail until server is up.")
+
+    deployment_metadata = n1_policy.get_deployment_metadata()
+    if deployment_metadata:
+        expected_video_keys = ["ego_view_left", "ego_view_right"] if config.stereo_ego_view else ["ego_view"]
+        checks = {
+            "video_keys": expected_video_keys,
+            "requires_tactile": config.use_tactile,
+            "action_horizon": config.action_horizon,
+        }
+        mismatches = [
+            f"{key}={deployment_metadata.get(key)!r} (client expects {expected!r})"
+            for key, expected in checks.items()
+            if deployment_metadata.get(key) != expected
+        ]
+        if mismatches:
+            raise ValueError("Policy deployment contract mismatch: " + "; ".join(mismatches))
+        print_green(f"Policy deployment contract verified: {deployment_metadata}")
 
     state_subscriber = ZMQStateSubscriber(
         host=config.state_zmq_host,
@@ -424,6 +481,18 @@ def main(config: InferenceConfig):
     camera_subscriber = ComposedCameraClientSensor(
         server_ip=config.camera_host, port=config.camera_port
     )
+
+    tactile_subscriber = None
+    if config.use_tactile:
+        tactile_subscriber = TactileSubscriber(
+            host=config.tactile_zmq_host,
+            port=config.tactile_zmq_port,
+            max_age_sec=config.tactile_max_age_sec,
+        )
+        print_green(
+            f"Tactile subscriber connected to tcp://{config.tactile_zmq_host}:"
+            f"{config.tactile_zmq_port} (max age {config.tactile_max_age_sec:.3f}s)"
+        )
 
     zmq_context = zmq.Context()
     zmq_socket = zmq_context.socket(zmq.PUB)
@@ -707,6 +776,8 @@ def main(config: InferenceConfig):
                 language_prompt=language_prompt_ref[0],
                 log_errors=True,
                 stereo_ego_view=config.stereo_ego_view,
+                tactile_subscriber=tactile_subscriber,
+                use_tactile=config.use_tactile,
             ),
             lambda obs: run_policy_inference_and_process(
                 policy=n1_policy,
@@ -844,6 +915,8 @@ def main(config: InferenceConfig):
         zmq_socket.close()
         zmq_context.term()
         state_subscriber.close()
+        if tactile_subscriber is not None:
+            tactile_subscriber.close()
         keyboard_listener.close()
         print("Shutdown complete.")
 
