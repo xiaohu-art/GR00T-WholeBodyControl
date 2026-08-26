@@ -102,7 +102,11 @@ gear_sonic/scripts/replay_episode.py
 
 逻辑:把上面的「MuJoCo 状态回放」和下面的「触觉可视化」合到**一个进程、一个播放循环**里。运行后 MuJoCo 窗口和 OpenCV 触觉窗口**同时弹出**,由同一个帧索引驱动 —— 解决两个脚本分开启动时间对不上的问题。
 
-`observation.state` 和 `observation.tactile_raw` 来自同一个 parquet 的同样行,帧数天然一致,一个帧索引同时寻址两者,不做重采样。复用 `replay_state_mujoco.py` 的关节映射和 `visualize_tactile.py` 的触觉画布渲染,两个老脚本保持不变、仍可单独用。
+`observation.state` 和触觉列来自同一个 parquet 的同样行,帧数天然一致,
+一个帧索引同时寻址两者,不做重采样。三路数据会同时渲染
+`observation.tactile_vest` / `observation.tactile_left_arm` /
+`observation.tactile_right_arm`；老数据仍可使用单路 `observation.tactile_raw`。
+关节映射复用 `replay_state_mujoco.py`，触觉画布复用现有 viewer 实现。
 
 ### 前置
 - venv 里要同时有 `mujoco` 和 `cv2`(`.venv_sim` 两者都有,直接用它)
@@ -129,6 +133,8 @@ python gear_sonic/scripts/replay_episode.py \
 | `--joint-names ...` | 显式给一组 joint 名,覆盖 `meta/info.json` 的查找 |
 | `--no-tactile` | 跳过触觉窗口,只放 MuJoCo |
 | `--window` | OpenCV 触觉窗口标题 |
+| `--tactile-mode auto\|single\|triple` | 自动识别或强制单路/三路触觉 |
+| `--tactile-key <column>` | 单路模式指定 parquet 列 |
 
 ### 键位(需点中触觉窗口使其获得焦点)
 | 键 | 作用 |
@@ -141,6 +147,36 @@ python gear_sonic/scripts/replay_episode.py \
 | `q` / `ESC` | 退出 |
 
 MuJoCo 和 OpenCV 是两个独立原生窗口,无法合并成一个;键盘控制由触觉窗口的 `cv2.waitKey` 统一接管,改帧索引后两个窗口一起跳。SSH 远程登录需要 `ssh -X`。
+
+### 连续浏览 merged-clean 的全部 episode
+
+```bash
+./gear_sonic/scripts/replay_mujoco_tactile_playlist.sh
+```
+
+默认依次读取
+`outputs/desk_sweep_merged_clean/data/**/episode_*.parquet`，每条都从第 0 帧播到末帧，
+并同步显示 MuJoCo 关节姿态和 vest / left_arm / right_arm 三路触觉。
+也可把其他 LeRobot 数据集根目录作为第一个参数：
+
+```bash
+./gear_sonic/scripts/replay_mujoco_tactile_playlist.sh \
+    outputs/dynamic_load_merged_clean
+```
+
+键盘焦点需在任一触觉窗口上：
+
+| 键 | 作用 |
+|---|---|
+| `↑` | 切换到上一条 episode |
+| `↓` | 切换到下一条 episode |
+| `r` | 当前 episode 从头重放 |
+| `space` | 暂停 / 继续 |
+| `←` `→` | 暂停时单帧步进 |
+| `q` / `ESC` | 退出整个 playlist |
+
+当前 episode 自然播完后会自动进入下一条；只有全部 episode 都播完或人工退出时，
+playlist 才会结束。
 
 ---
 
